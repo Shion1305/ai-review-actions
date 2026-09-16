@@ -741,12 +741,28 @@ Keep summary to one or two short sentences, at most 240 characters: outcomes and
 Do not enumerate investigation steps, file contents, or configuration in the summary.
 The publisher determines the formal verdict. Do not recommend approval or merging in summary,
 or claim validation is complete when necessary validation remains unresolved.
-Write each finding body in one or two short paragraphs covering the defect, conditions,
-impact, evidence, and a suggested fix. Keep GitHub inline comments readable without
-repeated boilerplate headings. Return an empty findings array when no defects are found.
-Use plain, direct language. In Japanese, prefer short factual sentences and omit stock phrases
-such as repeated statements that something was checked. Do not claim there are no side effects
-without relevant evidence. Keep each assessment to one question and one short conclusion.
+Write findings for a developer who can read code but may be unfamiliar with this project
+or framework. Use a concrete title that names the problem rather than only a technical label.
+Connect the triggering input or situation, expected behavior, actual behavior, and why the
+changed code causes the difference. Explain the practical impact and suggest a concrete
+correction, including why it helps. Keep the essential explanation in the finding body so
+the reader can understand it without opening the investigation log.
+Explain unfamiliar terms or API behavior briefly when needed, using the relevant code
+identifiers. A small example or suggested verification can help clarify a tricky issue.
+Distinguish illustrative examples and proposed checks from results actually observed;
+do not imply that a reproduction or suggested fix was tested unless it was.
+Use enough short paragraphs to explain the cause and correction within the 3000-character
+body limit. Keep simple findings to a few sentences. Avoid repeated boilerplate headings,
+unrelated tutorials, and comments on the author's ability. Use respectful, direct language
+focused on the code; do not make a confirmed defect sound like an optional style preference.
+Ground the expected behavior, explanation, and correction in the evidence. Distinguish
+reproduced results from conclusions based on code inspection. If the evidence does not
+establish a defect, record the unresolved question in assessments or limitations instead.
+Return an empty findings array when no defects are found.
+Use plain language throughout. In Japanese, use polite desu/masu sentences and omit stock
+phrases such as repeated statements that something was checked. Do not claim there are no
+side effects without relevant evidence. Keep each assessment to one question and one short
+conclusion.
 Describe each unresolved gap once: put an unrun command and its reason in not_run_checks;
 use limitations only for other gaps, not paraphrases of the same missing command.
 Do not write a review-completion claim or an approval recommendation anywhere in the summary.
