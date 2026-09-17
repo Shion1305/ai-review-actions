@@ -6,6 +6,22 @@ inputs:
   report:
     description: 調査Actionが返したJSONレポート。
     required: true
+  review-context:
+    description: context Actionが取得したPRの議論JSON。指定すると要約を更新し、既存の指摘を再利用します。
+    required: false
+    default: ""
+  pull-request-number:
+    description: PRイベント以外から投稿する対象PR番号。指定する場合は調査時のhead-shaとbase-shaも必須です。
+    required: false
+    default: ""
+  head-sha:
+    description: pull-request-numberを指定する場合の、調査対象Head SHA。
+    required: false
+    default: ""
+  base-sha:
+    description: pull-request-numberを指定する場合の、調査対象Base SHA。
+    required: false
+    default: ""
   github-token:
     description: pull-requests:write権限を持つGitHubトークン。
     required: false
@@ -21,13 +37,13 @@ inputs:
 
 outputs:
   published:
-    description: この実行で新しいレビューを投稿した場合はtrue。
+    description: この実行でレビュー・返信・要約を投稿または更新した場合はtrue。
     value: ${{ steps.publish.outputs.published }}
   event:
-    description: 投稿したレビューの判定（APPROVE・COMMENT・REQUEST_CHANGES）。投稿を省略した場合は空文字。
+    description: 今回投稿・更新した結果の判定（APPROVE・COMMENT・REQUEST_CHANGES）。すべて省略した場合は空文字。
     value: ${{ steps.publish.outputs.event }}
   review-url:
-    description: 投稿したレビューのURL。投稿を省略した場合は空文字。
+    description: 投稿したレビューまたは最新の要約のURL。すべて省略した場合は空文字。
     value: ${{ steps.publish.outputs.review-url }}
 
 runs:
@@ -39,6 +55,10 @@ runs:
       env:
         AI_REVIEW_PUBLISH_PATH: ${{ github.action_path }}
         REVIEW_JSON: ${{ inputs.report }}
+        REVIEW_CONTEXT: ${{ inputs.review-context }}
+        REVIEW_PULL_REQUEST_NUMBER: ${{ inputs.pull-request-number }}
+        REVIEW_HEAD_SHA: ${{ inputs.head-sha }}
+        REVIEW_BASE_SHA: ${{ inputs.base-sha }}
         REVIEW_MODEL: ${{ inputs.model }}
         REVIEWER_LOGIN: ${{ inputs.reviewer-login }}
       with:
@@ -48,6 +68,10 @@ runs:
           const result = await publishReview({
             github, context, core,
             reportJson: process.env.REVIEW_JSON,
+            reviewContext: process.env.REVIEW_CONTEXT,
+            pullRequestNumber: process.env.REVIEW_PULL_REQUEST_NUMBER,
+            headSha: process.env.REVIEW_HEAD_SHA,
+            baseSha: process.env.REVIEW_BASE_SHA,
             model: process.env.REVIEW_MODEL,
             reviewerLogin: process.env.REVIEWER_LOGIN,
             runAttempt: process.env.GITHUB_RUN_ATTEMPT,

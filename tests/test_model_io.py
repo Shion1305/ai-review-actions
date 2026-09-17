@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import json
+import sys
+import unittest
+from pathlib import Path
+
+from pydantic_ai import Agent, UsageLimits
+from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
+from pydantic_ai.messages import (
+    InstructionPart,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.usage import RequestUsage
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+from model_io import BoundedReviewModel, compact_history, request_input_bytes  # noqa: E402
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.time = 0.0
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.time
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.time += seconds
+
+
+class HistoryTest(unittest.TestCase):
+    def test_working_notes_are_byte_bounded_user_context(self) -> None:
+        initial = ModelRequest(parts=[UserPromptPart("Review")], instructions="fixed policy")
+        compacted = compact_history([initial], review_notes="仮説" * 10_000)
+        self.assertEqual(compacted[0], initial)
+        self.assertEqual(len(compacted), 2)
+        note_message = compacted[1]
+        self.assertTrue(note_message.metadata and note_message.metadata.get("review_working_notes"))
+        self.assertIsInstance(note_message, ModelRequest)
+        assert isinstance(note_message, ModelRequest)
+        self.assertIsNone(note_message.instructions)
+        assert isinstance(note_message.parts[0], UserPromptPart)
+        content = note_message.parts[0].content
+        assert isinstance(content, str)
+        self.assertLessEqual(len(content.encode("utf-8")), 6000)
+        self.assertIn("model-authored", content)
+        self.assertIn("not evidence", content)
+        self.assertIn("untrusted", content)
+        self.assertEqual(compact_history(compacted, review_notes=""), [initial])
+
+    def test_pending_tool_call_is_retained_until_its_later_return(self) -> None:
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart("Review")]),
+            ModelResponse(parts=[ToolCallPart("delayed_source", {}, "pending")]),
+            ModelRequest(parts=[UserPromptPart("The delayed result is pending.")]),
+        ]
+        for index in range(5):
+            messages.extend(
+                [
+                    ModelResponse(parts=[ToolCallPart("read_file", {}, str(index))]),
+                    ModelRequest(
+                        parts=[
+                            ToolReturnPart("read_file", f"[step_id={index + 1}] source", str(index))
+                        ]
+                    ),
+                ]
+            )
+        compacted = compact_history(messages)
+        calls = [p.tool_call_id for m in compacted for p in m.parts if isinstance(p, ToolCallPart)]
+        self.assertIn("pending", calls)
+        messages.append(ModelRequest(parts=[ToolReturnPart("delayed_source", "source", "pending")]))
+        compacted = compact_history(messages)
+        calls = [p.tool_call_id for m in compacted for p in m.parts if isinstance(p, ToolCallPart)]
+        self.assertIn("pending", calls)
+
+    def test_recalled_observation_is_not_archived_as_a_new_step(self) -> None:
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("Review")])]
+        for index in range(6):
+            tool_name = "read_observation" if index == 1 else "read_file"
+            messages.extend(
+                [
+                    ModelResponse(parts=[ToolCallPart(tool_name, {}, str(index))]),
+                    ModelRequest(
+                        parts=[ToolReturnPart(tool_name, "[step_id=1] source", str(index))]
+                    ),
+                ]
+            )
+        compacted = compact_history(messages)
+        index_message = compacted[1]
+        assert isinstance(index_message.parts[0], UserPromptPart)
+        assert isinstance(index_message.parts[0].content, str)
+        index = json.loads(index_message.parts[0].content.split("\n", 1)[1])
+        self.assertEqual(index["archived_count"], 1)
+        self.assertEqual([entry["tool"] for entry in index["observations"]], ["read_file"])
+
+    def test_compaction_bounds_utf8_without_mutating_or_breaking_pairs(self) -> None:
+        initial = ModelRequest(
+            parts=[UserPromptPart("Review this change")], instructions="fixed policy"
+        )
+        messages: list[ModelMessage] = [initial]
+        for index in range(5):
+            messages.extend(
+                [
+                    ModelResponse(
+                        parts=[
+                            ThinkingPart("reasoning", signature=f"signature-{index}"),
+                            ToolCallPart("read_file", {"path": "src/app.py"}, str(index)),
+                        ]
+                    ),
+                    ModelRequest(
+                        parts=[
+                            ToolReturnPart(
+                                "read_file",
+                                f"[step_id={index + 1}]\nOLD_OUTPUT_{index}\n" + "変更" * 20000,
+                                str(index),
+                            )
+                        ]
+                    ),
+                ]
+            )
+        original = ModelMessagesTypeAdapter.dump_json(messages)
+        compacted = compact_history(messages)
+        self.assertEqual(ModelMessagesTypeAdapter.dump_json(messages), original)
+        self.assertEqual(compacted[0], initial)
+        self.assertEqual(len(compacted), 10)
+        index_message = compacted[1]
+        self.assertIsInstance(index_message, ModelRequest)
+        self.assertTrue(all(isinstance(p, UserPromptPart) for p in index_message.parts))
+        index_json = ModelMessagesTypeAdapter.dump_json([index_message])
+        self.assertIn(b"read_observation", index_json)
+        self.assertNotIn(b"OLD_OUTPUT_0", index_json)
+        self.assertNotIn(b"signature-0", index_json)
+        for index in range(1, 5):
+            response, request = compacted[index * 2 : index * 2 + 2]
+            self.assertEqual(response.parts, messages[index * 2 + 1].parts)
+            result = request.parts[0]
+            assert isinstance(result, ToolReturnPart)
+            assert isinstance(result.content, str)
+            self.assertEqual(result.tool_call_id, str(index))
+            self.assertIn(f"[step_id={index + 1}]", result.content)
+            self.assertLessEqual(len(result.content.encode("utf-8")), 500 if index < 3 else 6000)
+        self.assertEqual(compact_history(compacted), compacted)
+
+
+class ModelIOTest(unittest.IsolatedAsyncioTestCase):
+    def model(self, function, clock=None, **kwargs):
+        clock = clock or FakeClock()
+        return BoundedReviewModel(
+            FunctionModel(function), sleep=clock.sleep, monotonic=clock.now, **kwargs
+        )
+
+    async def test_real_agent_compacts_repeated_large_results(self) -> None:
+        request_sizes = []
+        tool_runs = []
+
+        def respond(messages, _info):
+            request_sizes.append(len(ModelMessagesTypeAdapter.dump_json(messages)))
+            if len(request_sizes) <= 8:
+                return ModelResponse(parts=[ToolCallPart("inspect_source", {})])
+            return ModelResponse(parts=[TextPart("Finished")])
+
+        agent = Agent(self.model(respond), capabilities=[ProcessHistory(compact_history)])
+
+        @agent.tool_plain
+        def inspect_source() -> str:
+            tool_runs.append(1)
+            return f"[step_id={len(tool_runs)}]\n" + "build artifact source " * 5000
+
+        result = await agent.run("Review the change")
+        self.assertEqual(result.output, "Finished")
+        self.assertEqual(len(tool_runs), 8)
+        self.assertLess(max(request_sizes), 40000)
+
+    async def test_updated_working_notes_replace_previous_notes_across_forty_turns(self) -> None:
+        working_notes = [""]
+        tool_runs = []
+        request_sizes = []
+
+        def process(messages):
+            return compact_history(messages, review_notes=working_notes[0])
+
+        def respond(messages, _info):
+            request_sizes.append(len(ModelMessagesTypeAdapter.dump_json(messages)))
+            self.assertLessEqual(sum(isinstance(m, ModelResponse) for m in messages), 4)
+            notes = [
+                p.content
+                for m in messages
+                for p in m.parts
+                if isinstance(p, UserPromptPart)
+                and isinstance(p.content, str)
+                and p.content.startswith("Review working notes")
+            ]
+            self.assertEqual(len(notes), int(bool(tool_runs)))
+            if notes:
+                self.assertIn(working_notes[0], notes[0])
+                if len(tool_runs) > 1:
+                    self.assertNotIn(f"working-summary-{len(tool_runs) - 1};", notes[0])
+            if len(tool_runs) < 40:
+                return ModelResponse(parts=[ToolCallPart("inspect_source", {})])
+            return ModelResponse(parts=[TextPart("Finished")])
+
+        agent = Agent(self.model(respond), capabilities=[ProcessHistory(process)])
+
+        @agent.tool_plain
+        def inspect_source() -> str:
+            tool_runs.append(1)
+            working_notes[0] = f"working-summary-{len(tool_runs)}; check the remaining caller."
+            return f"[step_id={len(tool_runs)}]\n" + "raw source " * 10_000
+
+        result = await agent.run("Review", usage_limits=UsageLimits(request_limit=45))
+        self.assertEqual(result.output, "Finished")
+        self.assertEqual(len(tool_runs), 40)
+        self.assertLess(max(request_sizes), 40000)
+
+    async def test_long_investigation_keeps_bounded_recent_cycles_and_archived_index(self) -> None:
+        request_sizes = []
+        tool_runs = []
+        requests = []
+
+        def respond(messages, _info):
+            requests.append(messages)
+            request_sizes.append(len(ModelMessagesTypeAdapter.dump_json(messages)))
+            responses = [m for m in messages if isinstance(m, ModelResponse)]
+            self.assertLessEqual(len(responses), 4)
+            calls = {
+                p.tool_call_id for m in responses for p in m.parts if isinstance(p, ToolCallPart)
+            }
+            for message in messages:
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart):
+                        self.assertIn(part.tool_call_id, calls)
+            if len(requests) <= 100:
+                return ModelResponse(
+                    parts=[
+                        TextPart("planning " * 500),
+                        ThinkingPart("reasoning", signature=f"signature-{len(requests)}"),
+                        ToolCallPart("inspect_source", {"path": "src/app.py"}),
+                    ]
+                )
+            return ModelResponse(parts=[TextPart("Finished")])
+
+        agent = Agent(
+            self.model(respond),
+            instructions="policy " * 300,
+            capabilities=[ProcessHistory(compact_history)],
+        )
+
+        @agent.tool_plain
+        def inspect_source(path: str) -> str:
+            tool_runs.append(path)
+            return f"[step_id={len(tool_runs)}]\n" + "discarded raw observation " * 5000
+
+        result = await agent.run(
+            "Review the change", usage_limits=UsageLimits(request_limit=120, tool_calls_limit=100)
+        )
+        self.assertEqual(result.output, "Finished")
+        self.assertEqual(len(tool_runs), 100)
+        self.assertLess(max(request_sizes), 60000)
+        self.assertLess(abs(request_sizes[-1] - request_sizes[-20]), 1000)
+        final_messages = requests[-1]
+        indexes = [
+            p.content
+            for m in final_messages
+            for p in m.parts
+            if isinstance(p, UserPromptPart)
+            and isinstance(p.content, str)
+            and p.content.startswith("Archived observation index")
+        ]
+        self.assertEqual(len(indexes), 1)
+        index = indexes[0]
+        self.assertLessEqual(len(index.encode()), 6000)
+        self.assertIn('"archived_count":96', index)
+        self.assertIn('"last_step_id":96', index)
+        self.assertNotIn("discarded raw observation", index)
+        self.assertGreater(json.loads(index.split("\n", 1)[1])["omitted_index_entries"], 0)
+
+    async def test_429_retries_identical_request_without_reexecuting_tools(self) -> None:
+        clock = FakeClock()
+        calls = []
+        tool_runs = []
+
+        def respond(messages, _info):
+            calls.append(ModelMessagesTypeAdapter.dump_json(messages))
+            if len(calls) == 1:
+                return ModelResponse(parts=[ToolCallPart("inspect_source", {})])
+            if len(calls) == 2:
+                raise ModelHTTPError(
+                    429,
+                    "fake",
+                    {
+                        "error": {
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "12.5s",
+                                }
+                            ]
+                        }
+                    },
+                )
+            return ModelResponse(parts=[TextPart("Finished")])
+
+        agent = Agent(self.model(respond, clock))
+
+        @agent.tool_plain
+        def inspect_source() -> str:
+            tool_runs.append(1)
+            return "source"
+
+        result = await agent.run("Review")
+        self.assertEqual(result.output, "Finished")
+        self.assertEqual(tool_runs, [1])
+        self.assertEqual(calls[1], calls[2])
+        self.assertEqual(clock.sleeps, [5.0, 12.5])
+
+    async def test_oversized_schema_or_instructions_rejected_before_network(self) -> None:
+        calls = []
+
+        def respond(messages, _info):
+            calls.append(messages)
+            return ModelResponse(parts=[TextPart("unexpected")])
+
+        model = self.model(respond, max_input_bytes=1000)
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("hello")])]
+        for parameters in [
+            ModelRequestParameters(
+                function_tools=[ToolDefinition(name="large", description="x" * 2000)]
+            ),
+            ModelRequestParameters(),
+        ]:
+            with self.subTest(parameters=parameters), self.assertRaises(UsageLimitExceeded):
+                request_messages = (
+                    messages
+                    if parameters.function_tools
+                    else [ModelRequest(parts=[UserPromptPart("hello")], instructions="x" * 2000)]
+                )
+                await model.request(request_messages, None, parameters)
+        self.assertEqual(calls, [])
+
+    async def test_sliding_minute_budget_counts_retry_attempts(self) -> None:
+        clock = FakeClock()
+        calls = []
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("hello")])]
+        parameters = ModelRequestParameters()
+        size = request_input_bytes(messages, None, parameters)
+
+        def respond(_messages, _info):
+            calls.append(clock.now())
+            if len(calls) == 1:
+                raise ModelHTTPError(429, "fake", headers={"Retry-After": "7"})
+            return ModelResponse(parts=[TextPart("done")])
+
+        model = self.model(
+            respond,
+            clock,
+            max_input_bytes=size,
+            input_bytes_per_minute=size,
+            min_request_interval=0,
+        )
+        await model.request(messages, None, parameters)
+        self.assertEqual(calls, [0.0, 60.0])
+        self.assertEqual(clock.sleeps, [7.0, 53.0])
+
+    async def test_settings_output_schema_and_instruction_parts_count_toward_budget(self) -> None:
+        calls = []
+
+        def respond(messages, _info):
+            calls.append(messages)
+            return ModelResponse(parts=[TextPart("unexpected")])
+
+        cases: list[tuple[ModelSettings | None, ModelRequestParameters]] = [
+            ({"extra_body": {"system": "x" * 2000}}, ModelRequestParameters()),
+            (None, ModelRequestParameters(instruction_parts=[InstructionPart("x" * 2000)])),
+            (
+                None,
+                ModelRequestParameters(
+                    output_tools=[ToolDefinition(name="report", description="x" * 2000)]
+                ),
+            ),
+        ]
+        model = self.model(respond, max_input_bytes=1000)
+        for settings, parameters in cases:
+            with self.subTest(parameters=parameters), self.assertRaises(UsageLimitExceeded):
+                await model.request(
+                    [ModelRequest(parts=[UserPromptPart("hi")])], settings, parameters
+                )
+        self.assertEqual(calls, [])
+
+    async def test_usage_logs_report_bytes_and_actual_tokens_without_request_content(self) -> None:
+        def respond(_messages, _info):
+            return ModelResponse(
+                parts=[TextPart("done")],
+                usage=RequestUsage(input_tokens=11, output_tokens=4, cache_read_tokens=7),
+            )
+
+        with self.assertLogs("model_io", level="INFO") as logs:
+            await Agent(self.model(respond)).run("private-source-should-never-appear-in-logs")
+        output = "\n".join(logs.output)
+        self.assertIn("serialized_input_bytes=", output)
+        self.assertIn("input_tokens=11 output_tokens=4 cache_read_tokens=7", output)
+        self.assertNotIn("private-source", output)
+
+    async def test_exhausted_429_becomes_safe_usage_limit(self) -> None:
+        calls = []
+
+        def respond(_messages, _info):
+            calls.append(1)
+            raise ModelHTTPError(429, "fake", {"secret": "do-not-leak"})
+
+        with self.assertRaises(UsageLimitExceeded) as caught:
+            await Agent(self.model(respond)).run("Review")
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("do-not-leak", str(caught.exception))
+
+    async def test_long_retry_after_stops_without_ignoring_provider_delay(self) -> None:
+        clock = FakeClock()
+        calls = []
+
+        def respond(_messages, _info):
+            calls.append(1)
+            raise ModelHTTPError(429, "fake", headers={"Retry-After": "600"})
+
+        with self.assertRaises(UsageLimitExceeded):
+            await Agent(self.model(respond, clock)).run("Review")
+        self.assertEqual(calls, [1])
+        self.assertEqual(clock.sleeps, [])
+
+    async def test_only_transient_provider_failures_are_retried(self) -> None:
+        for status in [400, 401, 403, 404, 500, 502, 503]:
+            calls = []
+
+            def respond(_messages, _info):
+                calls.append(1)
+                raise ModelHTTPError(status, "fake")
+
+            with self.subTest(status=status), self.assertRaises(ModelHTTPError):
+                await Agent(self.model(respond)).run("Review")
+            self.assertEqual(len(calls), 3 if status in {502, 503} else 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

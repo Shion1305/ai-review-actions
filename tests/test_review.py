@@ -115,7 +115,7 @@ class ReviewReportTest(unittest.TestCase):
                 review.Assessment(
                     question="変更した条件で正常に動くか。",
                     conclusion="境界条件を確認しました。",
-                    evidence_step_ids=[1, 30],
+                    evidence_step_ids=[1, 100],
                     resolved=True,
                 )
             ],
@@ -123,12 +123,13 @@ class ReviewReportTest(unittest.TestCase):
                 review.InvestigationStep(
                     id=index + 1,
                     tool="read_file",
-                    purpose="関連実装の確認",
-                    command="read file",
+                    purpose="確認" * 200,
+                    command="調査" * 1_000,
                     exit_code=0,
                     result="調" * 900,
+                    code_evidence=True,
                 )
-                for index in range(30)
+                for index in range(100)
             ],
             findings=[
                 review.Finding(
@@ -137,7 +138,7 @@ class ReviewReportTest(unittest.TestCase):
                     file="example.ts",
                     line=1,
                     body="指摘の根拠と修正案",
-                    evidence_step_ids=[1, 30],
+                    evidence_step_ids=[1, 100],
                 )
             ],
         )
@@ -149,7 +150,10 @@ class ReviewReportTest(unittest.TestCase):
         self.assertLessEqual(len(payload.encode("utf-8")), 40_000)
         self.assertEqual(value["findings"], report.model_dump()["findings"])
         self.assertEqual(value["assessments"], report.model_dump()["assessments"])
-        self.assertEqual([step["id"] for step in value["investigation"]], list(range(1, 31)))
+        self.assertEqual([step["id"] for step in value["investigation"]], list(range(1, 101)))
+        self.assertTrue(all(step["code_evidence"] for step in value["investigation"]))
+        for step in value["investigation"]:
+            self.assertTrue(all(step[field].strip() for field in ("purpose", "command", "result")))
         self.assertIn("実行ログ", value["investigation"][0]["result"])
 
 
@@ -174,7 +178,7 @@ class ReviewPromptTest(unittest.TestCase):
         self.assertIn("Base SHA: base123", prompt)
         self.assertIn("Head SHA: head456", prompt)
         self.assertIn("Write all user-facing review text in 日本語", prompt)
-        self.assertIn("at most 24 investigation tool calls", prompt)
+        self.assertIn("at most 80 investigation tool calls", prompt)
         self.assertIn("review_complete=false", prompt)
         self.assertTrue(review.SYSTEM_INSTRUCTIONS.isascii())
         english_prompt = review.build_review_prompt(
@@ -191,7 +195,7 @@ class ReviewPromptTest(unittest.TestCase):
     def test_next_investigation_step_uses_the_previous_sandbox_output(self) -> None:
         class InvestigationSandbox(CheckoutSandbox):
             def execute(self, command: list[str], timeout_seconds: int = 120):
-                if "diff" in command:
+                if " diff " in " ".join(command):
                     return review.CommandResult(0, "changed-file: discovered.py", "")
                 if command[:2] == ["sed", "-n"]:
                     return review.CommandResult(0, "reproduction: python3 reproduce.py", "")
@@ -273,10 +277,10 @@ class ReviewPromptTest(unittest.TestCase):
     def test_exploratory_probe_is_not_treated_as_required_verification(self) -> None:
         class ProbeSandbox(CheckoutSandbox):
             def execute(self, command: list[str], timeout_seconds: int = 120):
+                if " diff " in " ".join(command):
+                    return review.CommandResult(0, "@@ -1 +1 @@\n-old wording\n+new wording", "")
                 if command[:2] == ["sh", "-lc"]:
                     return review.CommandResult(1, "", "optional linter is unavailable")
-                if "diff" in command:
-                    return review.CommandResult(0, "Only documentation wording changed.", "")
                 return super().execute(command, timeout_seconds)
 
         def respond(messages, info):
@@ -287,7 +291,7 @@ class ReviewPromptTest(unittest.TestCase):
                 if isinstance(part, ToolReturnPart)
             ]
             if not returns:
-                return ModelResponse([ToolCallPart("get_pull_request_diff", {})])
+                return ModelResponse([ToolCallPart("get_pull_request_diff", {"path": "README.md"})])
             if len(returns) == 1:
                 return ModelResponse(
                     [
@@ -366,6 +370,12 @@ class ReviewPromptTest(unittest.TestCase):
         self.assertFalse(report.review_complete)
 
     def test_invalid_evidence_is_returned_to_the_model_for_correction(self) -> None:
+        class PatchSandbox(CheckoutSandbox):
+            def execute(self, command: list[str], timeout_seconds: int = 120):
+                if " diff " in " ".join(command):
+                    return review.CommandResult(0, "@@ -1 +1 @@\n-old wording\n+new wording", "")
+                return super().execute(command, timeout_seconds)
+
         def respond(messages, info):
             returns = [
                 part
@@ -374,7 +384,7 @@ class ReviewPromptTest(unittest.TestCase):
                 if isinstance(part, ToolReturnPart)
             ]
             if not returns:
-                return ModelResponse([ToolCallPart("get_pull_request_diff", {})])
+                return ModelResponse([ToolCallPart("get_pull_request_diff", {"path": "README.md"})])
             retries = [
                 part
                 for message in messages
@@ -407,7 +417,7 @@ class ReviewPromptTest(unittest.TestCase):
             )
 
         report = review.review_pull_request(
-            self.config(), CheckoutSandbox(), model=FunctionModel(respond)
+            self.config(), PatchSandbox(), model=FunctionModel(respond)
         )
         self.assertTrue(report.review_complete)
         self.assertEqual(report.assessments[0].evidence_step_ids, [1])
@@ -536,13 +546,13 @@ class ReviewConfigTest(unittest.TestCase):
             "REVIEW_SOURCE_DIRECTORY": "/checkout",
             "REVIEW_SANDBOX_IMAGE": "node:test",
             "REVIEW_LANGUAGE": "日本語",
-            "REVIEW_REQUEST_LIMIT": "81",
+            "REVIEW_REQUEST_LIMIT": "241",
             "REVIEW_TOOL_CALL_LIMIT": "30",
             "REVIEW_INVESTIGATION_TOOL_LIMIT": "24",
         }
 
         with patch.dict(os.environ, environment, clear=True):
-            with self.assertRaisesRegex(ValueError, "between 2 and 80"):
+            with self.assertRaisesRegex(ValueError, "between 2 and 240"):
                 review.ReviewConfig.from_env()
 
 
@@ -553,22 +563,16 @@ class ReviewToolsTest(unittest.TestCase):
 
         result = tools.get_pull_request_diff()
 
-        self.assertEqual(
-            sandbox.calls,
-            [
-                (
-                    [
-                        "git",
-                        "--no-pager",
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "base123...head456",
-                    ],
-                    120,
-                )
-            ],
+        command, timeout = sandbox.calls[0]
+        self.assertEqual(command[:2], ["sh", "-lc"])
+        self.assertEqual(timeout, 120)
+        self.assertIn(
+            "git --literal-pathspecs --no-pager diff --no-ext-diff --no-textconv "
+            "--numstat base123...head456",
+            command[2],
         )
+        self.assertIn("sed -n 1,200p", command[2])
+        self.assertIn("[total inventory lines]", command[2])
         self.assertEqual(result, "[step_id=1]\n[exit_code=0]\ndiff output")
         self.assertEqual(tools.steps[0].exit_code, 0)
         self.assertIn("base123...head456", tools.steps[0].command)

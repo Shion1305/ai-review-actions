@@ -5,9 +5,12 @@
 調査やコマンド実行は、Gemini APIキーを保持するオーケストレーターではなく、使い捨ての
 Dockerサンドボックス内で行います。
 
-調査には`ynufes-tech/ai-review-actions`、検証と正式なPR Reviewの投稿には
-`ynufes-tech/ai-review-actions/publish`を使用します。モデルAPIキーを持つ調査ジョブと、
-`pull-requests: write`権限を持つ投稿ジョブを分離して利用してください。
+議論の取得には`ynufes-tech/ai-review-actions/context`、調査には
+`ynufes-tech/ai-review-actions`、検証と投稿には`ynufes-tech/ai-review-actions/publish`を
+使用します。モデルAPIキーを持つ調査ジョブと、`pull-requests: write`権限を持つ投稿ジョブを
+分離してください。差分・会話履歴への入力上限を設け、既存の指摘と返信を踏まえて要約を更新します。
+
+設計の根拠、CodeRabbitの公開仕様との比較、制約は[レビューの設計](docs/review-architecture.md)にまとめています。
 
 ## 使い方
 
@@ -18,20 +21,41 @@ checkoutにはBaseとHeadの両方のコミットが必要です。次の例のA
 name: AI PR Review
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 permissions: {}
 concurrency:
   group: ai-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  analyze:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
       github.actor != 'dependabot[bot]'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      context: ${{ steps.context.outputs.context }}
+      review-base-sha: ${{ steps.context.outputs.review-base-sha }}
+      head-sha: ${{ steps.context.outputs.head-sha }}
+      base-sha: ${{ steps.context.outputs.base-sha }}
+      skip-review: ${{ steps.context.outputs.skip-review }}
+    steps:
+      - id: context
+        uses: ynufes-tech/ai-review-actions/context@v2
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          review-profile: model=gemini-3.8-flash;language=ja;network=none;budgets=default;mcp=none;policy=1
+
+  analyze:
+    needs: prepare
+    if: needs.prepare.outputs.skip-review != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
@@ -40,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.prepare.outputs.head-sha }}
           fetch-depth: 0
           persist-credentials: false
           path: source
@@ -51,12 +75,14 @@ jobs:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
           repository: ${{ github.repository }}
           pull-request-number: ${{ github.event.pull_request.number }}
-          base-sha: ${{ github.event.pull_request.base.sha }}
-          head-sha: ${{ github.event.pull_request.head.sha }}
+          base-sha: ${{ needs.prepare.outputs.base-sha }}
+          head-sha: ${{ needs.prepare.outputs.head-sha }}
+          review-base-sha: ${{ needs.prepare.outputs.review-base-sha }}
+          review-context: ${{ needs.prepare.outputs.context }}
           source-directory: source
 
   publish:
-    needs: analyze
+    needs: [prepare, analyze]
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
@@ -65,7 +91,17 @@ jobs:
       - uses: ynufes-tech/ai-review-actions/publish@v2
         with:
           report: ${{ needs.analyze.outputs.report }}
+          review-context: ${{ needs.prepare.outputs.context }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          head-sha: ${{ needs.prepare.outputs.head-sha }}
+          base-sha: ${{ needs.prepare.outputs.base-sha }}
 ```
+
+3つのActionを同じ検証済みコミットSHAへ固定してください。GitHub Appを使う場合は、
+`context`と`publish`の両方に同じ`reviewer-login`を指定します。上の例はpush等で動く最小構成です。
+`review-profile`はモデル・レビュー方針・上限・MCP等を識別する秘密情報を含まない文字列です。
+設定を変更したら更新してください。Actionのリビジョンと併せて、古い条件の完了結果を再利用しないために使います。
+返信イベントや手動実行を追加する際の対象判定・権限・競合制御は[イベントの設計](docs/review-architecture.md#イベントと権限)を参照してください。
 
 モデルが生成するレビュー文の既定言語は日本語です。モデル生成文を別の言語にする場合は
 `review-language`を指定してください。投稿側の見出し、Actionが補う制約・通知、
@@ -145,6 +181,8 @@ Actionはcheckoutが指定されたHead SHAと一致することを検証し、`
 ## レビューの投稿
 
 `publish` Actionは`pull_request`イベントのコンテキストと`report`入力を使用します。
+他のイベントでは`pull-request-number`と、調査時の`head-sha`・`base-sha`を渡します。
+投稿前に実際のPRと照合するため、調査中にコミットが変わった結果は投稿されません。
 checkoutやGemini APIキーは不要です。`github-token`の既定値は`${{ github.token }}`です。
 モデルを変更する場合は、調査Actionと投稿Actionの両方へ同じ`model`を指定してください。
 投稿本文の見出しと判定理由は日本語です。
@@ -170,7 +208,7 @@ checkoutやモデル生成コマンドの実行を行いません。
 
 ```yaml
   publish:
-    needs: analyze
+    needs: [prepare, analyze]
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions: {}
@@ -191,6 +229,10 @@ checkoutやモデル生成コマンドの実行を行いません。
           report: ${{ needs.analyze.outputs.report }}
           github-token: ${{ steps.app-token.outputs.token }}
           reviewer-login: ${{ format('{0}[bot]', steps.app-token.outputs.app-slug) }}
+          review-context: ${{ needs.prepare.outputs.context }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          head-sha: ${{ needs.prepare.outputs.head-sha }}
+          base-sha: ${{ needs.prepare.outputs.base-sha }}
 ```
 
 トークンの対象はこのリポジトリだけ、権限はPR操作だけに制限し、ジョブ終了時に失効させます。
@@ -208,8 +250,12 @@ Appのインストール先や権限、秘密鍵が正しくない場合は失�
 未完了の場合はモデルの完了宣言を本文へ出さず、検証が残ることを固定文で示します。
 要約と各評価の結論は240文字以内に制限し、同じ未確認事項を複数の節へ言い換えて並べないよう指示します。
 ログはHTMLとして解釈されないコード表示にします。
-表示用のエスケープで本文サイズが上限を超える場合は、各記録をJSON形式で実行ログへ明示的に
-出力し、本文の詳細をその実行ログへのリンクへ置き換えます。
+要約・正式なレビュー・インライン指摘・返信は、エスケープと状態マーカーの付加後に
+60,000 UTF-8バイト以内かを確認します。超過時は、まず調査ログを実行ログへのリンクへ
+置き換え、それでも大きい場合は説明文を省略表示にします。全文のレポートをJSON形式で
+実行ログへ保存し、抜粋であることと確認先を表示します。
+判定、未完了の状態、指摘の重大度・タイトル・場所、既存スレッドへのリンクを残し、
+Markdownの途中や再実行用の状態マーカーを機械的に切り落としません。
 
 GitHubのPR差分に対応する指摘は、該当行へのインラインコメントとして投稿します。
 差分外の行やpatchを取得できないファイルの指摘は、コードへのリンク付きで本文に残します。
@@ -256,8 +302,34 @@ JSONの構造・文字数・対象SHAを検証した後、コードで判定し�
 失敗として返します。既定の`GITHUB_TOKEN`で承認を使う場合は、リポジトリ設定で
 GitHub ActionsによるPR承認を許可してください。GitHub App名義の場合は上記のApp設定を使用します。
 
-出力は`published`（新規投稿時に`true`）、`event`（判定）、`review-url`（投稿URL）です。
+出力は`published`（投稿・更新時に`true`）、`event`（判定）、`review-url`（レビューまたは要約URL）です。
 投稿を省略した場合、`published`は`false`、残りの出力は空文字です。
+
+### 既存の指摘と返信を扱う
+
+`context`のJSONを調査と投稿の両方の`review-context`へ渡すと、要約コメントを毎回更新します。
+正式なPR Reviewは新しい指摘、判定の変化、新しいコミットへの承認が必要な場合に投稿します。
+同じ指摘は既存のスレッドに結び付け、状態と人間からの返信に変化がない再評価は返信を省略します。
+
+`context`はPR説明、最大20スレッドの元コメントと直近5件の返信、一般コメント最大10件を
+合計30KB以内で取得します。モデルは`get_review_context`で必要な箇所をページ単位で読みます。
+省略があれば`truncated: true`となり、自動承認と完了済みスキップを禁止します。
+
+`findings[].existing_thread_id`は既存の指摘を表します。`prior_findings`は各スレッドについて
+`thread_id`、`status`（`still_present`・`fixed`・`uncertain`）、`body`、`evidence_step_ids`を返します。
+投稿側はスレッドの所属PR・元コメント・投稿者をGitHubで再確認します。
+「修正しました」という返信やoutdatedフラグだけでは修正済みにできず、現在のコードの根拠が必要です。
+未確認・未評価の指摘が残る場合や、調査中に議論が変わった場合は承認しません。
+
+完了したレビューのHeadを次回の差分基点に使います。Base変更や祖先関係の不成立時は全体比較へ戻り、
+古い未解決の指摘も再調査します。同じHead・Base・議論・Draft状態・Actionリビジョン・
+`review-profile`の完了済みレビューは省略します。
+`context`の`full-review: "true"`で、スキップと前回Headの再利用を無効にできます。
+
+既存スレッドの自動resolveや過去の変更要求の自動dismissはしません。`COMMENT`に変わっても
+GitHub上の過去の変更要求は残るため、解消後の承認または人間の操作が必要です。
+議論の永続的な学習や別PRへの引き継ぎは行いません。
+`review-context`を省略した場合は従来の実行ごとの投稿方式で動作します。
 
 ## v1からの移行
 
@@ -280,6 +352,11 @@ Pydantic AIは「モデルがツールを選ぶ → サンドボックスで実�
 
 | 操作 | ツール | 指定例 |
 | --- | --- | --- |
+| 変更ファイルの一覧 | `get_pull_request_diff` | `start_line=1, end_line=100` |
+| 特定ファイルの差分 | `get_pull_request_diff` | `path="src/app.py", start_line=1, end_line=200` |
+| PR説明・議論 | `get_review_context` | `section="description"` または `thread_id="...", start_index=1` |
+| 過去の観測を取り出す | `read_observation` | `step_id=3, start_char=1000`（省略時は索引） |
+| 作業メモを更新する | `save_review_notes` | `summary="調査済みの結論と残る疑問", evidence_step_ids=[1, 3]` |
 | ファイルを読む | `read_file` | `path="src/app.py", start_line=1, end_line=200` |
 | ファイルの所在を調べる | `list_directory` | `path="src", depth=2` |
 | 文字列を検索する | `search_text` | `pattern="handle_request", path="src"` |
@@ -394,11 +471,40 @@ MCPの認証ヘッダーをモデルの引数やコンテナへ渡しません�
 
 ## 使用上限
 
-既定値では、モデルリクエストを80回、ツール呼び出しを30回まで許可します。モデルには
-調査ツールを24回までに抑えるよう指示し、検証済みの最終結果を生成する余力を残します。
+| 入力 | 既定値 | 対象 |
+| --- | --- | --- |
+| `model-input-byte-limit` | 96,000 | 1要求の履歴・指示・ツール定義・設定を直列化したバイト数 |
+| `model-input-bytes-per-minute` | 384,000 | このプロセスの直近60秒の入力バイト予算。失敗した試行も含む |
+| `model-output-token-limit` | 8,192 | 1応答の出力トークン上限 |
+
+入力のバイト数はGoogleのトークン数やHTTP通信量とは異なります。成功した応答の実際の
+input/output/cacheトークン数もログに記録し、運用時の調整に使います。
+モデルへ渡すツール出力は約6KBに制限します。通常の入力には最初の依頼、直近4往復の会話と
+小さな調査索引を残し、古い会話・出力は除外します。観測は別のメモリに保持し、
+`read_observation`で必要な結果だけをページ単位で取得できます。
+短い作業メモには結論・指摘候補・未確認の疑問を残し、毎回置き換えます。メモも根拠IDと
+サイズを検証し、確定した証拠としては扱いません。
+巨大な差分は全件投入せず、ファイル一覧から必要な差分を最大400行ずつ読みます。
+
+要求間隔は最低5秒とし、429・502・503は最大3試行まで再送します。`Retry-After`とGoogleの
+`RetryInfo`を尊重し、SDK内部の重複リトライは無効化します。再送ではツールを再実行しません。
+待機は1要求で合計180秒までです。入力・待機予算の超過や429の継続時は未完了レポートを返し、
+承認しません。認証エラー等は通常の失敗として扱います。
+
+この予算は1実行内の制御です。Geminiの制限はAPIキー単位ではなくプロジェクト単位なので、
+他のPRやアプリと同時実行すれば429は起こり得ます。[Googleのレート制限](https://ai.google.dev/gemini-api/docs/rate-limits)
+を確認し、必要なら全利用者をまたぐキューやプロジェクトの分離を別途設計してください。
+
+既定値では、モデルリクエストを120回、ツール呼び出しを100回まで許可します。モデルには
+調査ツールを80回までに抑えるよう指示し、検証済みの最終結果を生成する余力を残します。
+これは入力トークン量や品質の基準ではなく、循環する調査を止める補助的な上限です。
+短いページ読み取りと大量出力のコマンドを回数だけで等価に扱わず、入力バイト・送信量と
+ワークフローのタイムアウトも別に制御します。
 先にPydantic AIの使用上限へ到達した場合は、調査結果をすべて破棄せず未完了のレポートを返します。
 
-`request-limit`、`tool-call-limit`、`investigation-tool-limit`では、これらの上限を引き下げられます。
+`request-limit`（最大240）、`tool-call-limit`（最大100）、`investigation-tool-limit`
+（ツール上限以下）で調整できます。100回でも完了を保証するものではなく、大きなPRでは
+入力予算・実行時間・調査範囲に応じて未完了となります。
 
 モデルや依存パッケージのバージョンについて、学習済み知識だけによる存在・互換性の断定は
 指摘から除外するよう指示します。必要な外部情報を確認できない場合は制約へ記録します。
@@ -458,7 +564,7 @@ uv run ruff format --check .
 uv run ruff check .
 uv run ty check src tests
 uv run python -m unittest discover -s tests
-node --test tests/test_publish.cjs
+node --test tests/test_*.cjs
 RUN_DOCKER_TESTS=1 uv run python tests/test_review.py DockerSandboxTest
 docker build --tag ai-review-sandbox:dev sandbox
 RUN_DOCKER_TESTS=1 uv run python tests/test_environment.py

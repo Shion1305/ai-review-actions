@@ -30,6 +30,26 @@ inputs:
   head-sha:
     description: Pull RequestのHeadコミットSHA。
     required: true
+  review-base-sha:
+    description: 前回レビュー済みのコミットSHA。祖先でない場合はPR全体の比較へ戻します。
+    required: false
+    default: ""
+  review-context:
+    description: context Actionが取得したPR説明・レビュー・返信の上限付きJSON。
+    required: false
+    default: "{}"
+  model-input-byte-limit:
+    description: 1回のモデル入力のUTF-8バイト上限。トークン数ではなく、履歴・ツール定義を含む保守的な制限です。
+    required: false
+    default: "96000"
+  model-input-bytes-per-minute:
+    description: この実行で1分間に送るモデル入力のバイト予算。別ジョブと共有するGoogleプロジェクト全体の上限ではありません。
+    required: false
+    default: "384000"
+  model-output-token-limit:
+    description: 1回のモデル応答の最大出力トークン数。
+    required: false
+    default: "8192"
   source-directory:
     description: Pull Requestと完全なGit履歴を含むcheckoutディレクトリ。
     required: false
@@ -51,17 +71,17 @@ inputs:
     required: false
     default: "{}"
   request-limit:
-    description: 出力検証の再試行を含むモデルリクエストの上限（最大80）。
+    description: 出力検証の再試行を含むモデルリクエスト回数の安全上限（最大240）。入力バイト予算とは別に適用します。
+    required: false
+    default: "120"
+  tool-call-limit:
+    description: 調査ツール呼び出し回数の安全上限（最大100）。ページ取得や返信の確認も含み、入力バイト予算とは別に適用します。
+    required: false
+    default: "100"
+  investigation-tool-limit:
+    description: 最終結果の生成余力を残すためモデルに指示する調査回数の目安。tool-call-limit以下で指定します（最大100）。
     required: false
     default: "80"
-  tool-call-limit:
-    description: ツール呼び出しの上限（最大30）。
-    required: false
-    default: "30"
-  investigation-tool-limit:
-    description: 最終結果の生成余力を残すため、プロンプトでモデルに指示する調査ツールの上限（最大24）。
-    required: false
-    default: "24"
 
 outputs:
   report:
@@ -112,6 +132,11 @@ runs:
         REVIEW_PULL_REQUEST_NUMBER: ${{ inputs.pull-request-number }}
         REVIEW_BASE_SHA: ${{ inputs.base-sha }}
         REVIEW_HEAD_SHA: ${{ inputs.head-sha }}
+        REVIEW_INCREMENTAL_BASE_SHA: ${{ inputs.review-base-sha }}
+        REVIEW_CONTEXT: ${{ inputs.review-context }}
+        REVIEW_MODEL_INPUT_BYTE_LIMIT: ${{ inputs.model-input-byte-limit }}
+        REVIEW_MODEL_INPUT_BYTES_PER_MINUTE: ${{ inputs.model-input-bytes-per-minute }}
+        REVIEW_MODEL_OUTPUT_TOKEN_LIMIT: ${{ inputs.model-output-token-limit }}
         REVIEW_SOURCE_DIRECTORY: ${{ inputs.source-directory }}
         REVIEW_SANDBOX_IMAGE: ${{ steps.sandbox.outputs.image }}
         REVIEW_SANDBOX_NETWORK: ${{ inputs.sandbox-network }}

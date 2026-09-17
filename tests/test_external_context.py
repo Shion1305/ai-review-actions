@@ -207,7 +207,10 @@ class MCPReviewTest(unittest.TestCase):
     def test_investigation_follows_code_to_documentation_and_linked_issue(self):
         class Sandbox(CheckoutSandbox):
             def execute(self, command, timeout_seconds=120):
-                if "diff" in command:
+                if (
+                    command[:2] == ["sh", "-lc"]
+                    and "git --literal-pathspecs --no-pager diff " in command[2]
+                ):
                     return review.CommandResult(0, "widget.py changes timeout from 2000 to 2.", "")
                 if command[:2] == ["sed", "-n"]:
                     return review.CommandResult(0, "widget version 2; timeout=2", "")
@@ -216,8 +219,10 @@ class MCPReviewTest(unittest.TestCase):
                 return super().execute(command, timeout_seconds)
 
         observed = []
+        response_count = 0
 
         def respond(messages, info):
+            nonlocal response_count
             definitions = {tool.name: tool for tool in info.function_tools}
             self.assertNotIn("mcp_docs_delete_issue", definitions)
             self.assertNotIn("mcp_github_delete_issue", definitions)
@@ -229,7 +234,8 @@ class MCPReviewTest(unittest.TestCase):
                 for part in message.parts
                 if isinstance(part, ToolReturnPart)
             ]
-            step = len(returns)
+            step = response_count
+            response_count += 1
             if returns:
                 observed.append(str(returns[-1].content))
             if step == 0:

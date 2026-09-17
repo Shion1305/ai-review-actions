@@ -1,0 +1,83 @@
+name: AIレビュー用の議論を取得
+description: PR本文・既存の指摘・返信を上限付きで取得し、差分レビューの基点とスキップ可否を判定します。
+author: ynufes-tech
+
+inputs:
+  github-token:
+    description: pull-requests:read権限を持つGitHubトークン。
+    required: false
+    default: ${{ github.token }}
+  reviewer-login:
+    description: レビュー投稿用アカウント名。GitHub Appの場合は「app-slug[bot]」を指定します。
+    required: false
+    default: github-actions[bot]
+  repository:
+    description: 対象リポジトリ（owner/name）。ワークフロー実行元と一致する必要があります。
+    required: false
+    default: ${{ github.repository }}
+  pull-request-number:
+    description: 対象の同一リポジトリ内の未完了Pull Request番号。
+    required: true
+  review-profile:
+    description: モデル・言語・上限・MCP・ルール設定を識別する安定した値（秘密情報を含めず4096バイト以内）。変更時はPR全体を再調査します。
+    required: true
+  full-review:
+    description: trueなら過去の完了状態を使ったスキップと差分基点の再利用を無効にします。
+    required: false
+    default: "false"
+
+outputs:
+  context:
+    description: 30KB以内の議論JSON。省略がある場合はtruncatedがtrueになります。
+    value: ${{ steps.collect.outputs.context }}
+  review-base-sha:
+    description: 差分レビューの基点SHA。過去の完了状態を再利用できない場合は実際のbase SHA。
+    value: ${{ steps.collect.outputs.review-base-sha }}
+  skip-review:
+    description: 同じコミット・議論・ドラフト状態・review-profile・Actionリビジョンで完全なレビューが済んでいる場合はtrue。
+    value: ${{ steps.collect.outputs.skip-review }}
+  head-sha:
+    description: 取得時点の対象HEAD SHA。
+    value: ${{ steps.collect.outputs.head-sha }}
+  base-sha:
+    description: 取得時点の実際のbase SHA。
+    value: ${{ steps.collect.outputs.base-sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: PRの議論と前回のレビュー状態を取得
+      id: collect
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      env:
+        AI_REVIEW_CONTEXT_PATH: ${{ github.action_path }}
+        REVIEW_REPOSITORY: ${{ inputs.repository }}
+        REVIEW_PULL_REQUEST_NUMBER: ${{ inputs.pull-request-number }}
+        REVIEWER_LOGIN: ${{ inputs.reviewer-login }}
+        REVIEW_FULL: ${{ inputs.full-review }}
+        REVIEW_PROFILE: ${{ inputs.review-profile }}
+        REVIEW_ACTION_REVISION: ${{ github.action_ref }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const { collectContext } = require(process.env.AI_REVIEW_CONTEXT_PATH + "/index.cjs");
+          if (!["true", "false"].includes(process.env.REVIEW_FULL)) {
+            throw new Error("full-review must be true or false.");
+          }
+          if (!process.env.REVIEW_ACTION_REVISION?.trim()) {
+            throw new Error("The context action revision is missing.");
+          }
+          const result = await collectContext({
+            github, context, core,
+            repository: process.env.REVIEW_REPOSITORY,
+            pullRequestNumber: process.env.REVIEW_PULL_REQUEST_NUMBER,
+            reviewerLogin: process.env.REVIEWER_LOGIN,
+            fullReview: process.env.REVIEW_FULL === "true",
+            reviewProfile: process.env.REVIEW_PROFILE,
+            actionRevision: process.env.REVIEW_ACTION_REVISION
+          });
+          core.setOutput("context", result.contextJson);
+          core.setOutput("review-base-sha", result.reviewBaseSha);
+          core.setOutput("skip-review", String(result.skipReview));
+          core.setOutput("head-sha", result.headSha);
+          core.setOutput("base-sha", result.baseSha);

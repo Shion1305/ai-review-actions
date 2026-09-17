@@ -34,7 +34,7 @@ function evidenceReport(overrides = {}) {
       evidence_step_ids: [1, 2], resolved: true,
     }],
     investigation: [
-      { id: 1, tool: "get_pull_request_diff", purpose: "変更内容を確認する。", command: "git diff", exit_code: 0, result: "文言の変更" },
+      { id: 1, tool: "get_pull_request_diff", purpose: "変更内容を確認する。", command: "git diff", exit_code: 0, result: "@@ -1 +1 @@\n-old wording\n+new wording" },
       { id: 2, tool: "run_command", purpose: "任意ツールの有無を調べる。", command: "command -v linter", exit_code: 1, result: "ツールなし" },
     ],
     not_run_checks: [], findings: [], ...overrides,
@@ -136,7 +136,7 @@ test("観測を解釈せずに完了と申告した場合は終了コードに�
 test("根拠付きの評価が同じなら終了コードだけで判定を変えない", async () => {
   for (const exit_code of [0, 1, 127]) {
     const h = harness(evidenceReport({
-      investigation: evidenceReport().investigation.map(step => ({ ...step, exit_code })),
+      investigation: evidenceReport().investigation.map(step => step.tool === "run_command" ? { ...step, exit_code } : step),
     }));
     assert.equal((await h.run()).event, "APPROVE");
   }
@@ -379,4 +379,541 @@ test("エスケープでログが大きくなる場合も投稿上限を守り�
   const records = h.logs.filter(line => line.startsWith("AI review observation: "));
   assert.equal(records.length, 30);
   assert.equal(JSON.parse(records[0].slice("AI review observation: ".length)).result, "&".repeat(1000));
+});
+
+test("長い未確認事項と指摘は重要な識別情報を残し、全文をログへ退避して投稿する", async t => {
+  const value = evidenceReport({
+    review_complete: false,
+    summary: "日本語の調査メモ🎉".repeat(80),
+    findings: Array.from({ length: 5 }, (_, index) => ({
+      ...finding(index ? "high" : "critical"), title: `重大な問題${index}🎉`,
+      file: `src/問題${index}.ts`, body: "```text\n[open ** _ ~ (x) \\\n" + "@".repeat(2900) + "\n```",
+    })),
+    limitations: ["認証の検証が未完了です。"],
+    not_run_checks: Array.from({ length: 6 }, (_, index) => ({
+      command: `未実行${index}: ` + '"'.repeat(450), result: "未確認理由: " + "&".repeat(900),
+    })),
+  });
+  const h = harness(value);
+  assert.ok(Buffer.byteLength(h.options.reportJson) < 60000);
+  await h.run();
+  const body = h.submitted[0].body;
+  assert.ok(Buffer.byteLength(body) <= 60000);
+  assert.ok(body.includes("変更をリクエスト · 調査未完了"));
+  for (const item of value.findings) {
+    assert.ok(body.includes(`[${item.severity}] ${item.title}`));
+    assert.ok(body.includes(`${item.file}:L${item.line}`));
+  }
+  for (let index = 0; index < 6; index++) assert.ok(body.includes(`未実行${index}`));
+  assert.ok(body.includes("認証の検証が未完了"));
+  assert.ok(body.includes("全文"));
+  assert.ok(body.includes("https://github.com/org/repo/actions/runs/100"));
+  assert.equal((body.match(/```/g) || []).length % 2, 0);
+  assert.ok(body.includes("&#91;open &#42;&#42; &#95; &#126; &#40;x&#41; &#92;"));
+  const saved = h.logs.find(line => line.startsWith("AI review full report: "));
+  assert.deepEqual(JSON.parse(saved.slice("AI review full report: ".length)), value);
+  assert.ok(!saved.includes("\n"));
+  t.diagnostic(`legacy review: ${Buffer.byteLength(body)} UTF-8 bytes`);
+});
+
+function statefulHarness(value = evidenceReport(), { threads = [], roots = [] } = {}) {
+  const h = harness(value, { files: [{ filename: "src/example.ts", patch: "@@ -0,0 +1 @@\n+new" }] });
+  Object.assign(h.options.context.payload.pull_request, { title: "Example", body: "" });
+  const reviews = [], summaries = [], reviewComments = [...roots], replies = [];
+  const own = { login: "github-actions[bot]" };
+  h.options.reviewContext = JSON.stringify({
+    schema_version: 1, pr: { title: "Example", body: "" }, threads, comments: [],
+    previous_head_sha: null, context_digest: "digest1", truncated: false,
+  });
+  const pulls = h.options.github.rest.pulls;
+  pulls.listReviewComments = () => {};
+  h.options.github.rest.issues = {
+    listComments() {},
+    createComment: async request => {
+      h.apiCalls.push("summary-create");
+      const item = { id: 900 + summaries.length, user: own, html_url: "https://github.com/org/repo/pull/42#issuecomment-900", ...request };
+      summaries.push(item);
+      return { data: item };
+    },
+    updateComment: async request => {
+      h.apiCalls.push("summary-update");
+      const item = summaries.find(item => item.id === request.comment_id);
+      Object.assign(item, request);
+      return { data: item };
+    },
+  };
+  h.options.github.paginate = async endpoint => {
+    if (endpoint === pulls.listReviews) return reviews;
+    if (endpoint === pulls.listReviewComments) return reviewComments;
+    if (endpoint === h.options.github.rest.issues.listComments) return summaries;
+    return [{ filename: "src/example.ts", patch: "@@ -0,0 +1 @@\n+new" }];
+  };
+  pulls.createReview = async request => {
+    h.apiCalls.push("create");
+    h.submitted.push(request);
+    const item = { id: reviews.length + 1000, user: own, state: { APPROVE: "APPROVED", REQUEST_CHANGES: "CHANGES_REQUESTED", COMMENT: "COMMENTED" }[request.event], html_url: "https://github.com/org/repo/pull/42#review", ...request };
+    reviews.push(item);
+    for (const comment of request.comments || []) reviewComments.push({
+      id: reviewComments.length + 2000, user: own, ...comment,
+      html_url: "https://github.com/org/repo/pull/42#discussion_r2000",
+    });
+    return { data: item };
+  };
+  pulls.createReplyForReviewComment = async request => {
+    h.apiCalls.push("reply");
+    const item = { id: reviewComments.length + 3000, user: own, in_reply_to_id: request.comment_id, ...request };
+    replies.push(item);
+    reviewComments.push(item);
+    return { data: item };
+  };
+  h.options.github.graphql = async (_query, { ids }) => ({ nodes: ids.map(id => {
+    const thread = threads.find(item => item.id === id);
+    return thread && {
+      id, isResolved: thread.is_resolved, isOutdated: thread.is_outdated,
+      pullRequest: { number: 42, repository: { nameWithOwner: "org/repo" } },
+      comments: { nodes: [{ databaseId: String(thread.comment_id) }] },
+    };
+  }) });
+  return { ...h, reviews, summaries, reviewComments, replies };
+}
+
+function ownThread() {
+  return { id: "THREAD_1", comment_id: 51, path: "src/example.ts", line: 1,
+    is_resolved: false, is_outdated: false, author: "github-actions[bot]", is_own: true, comments: [] };
+}
+
+function ownRoot(overrides = {}) {
+  return { id: 51, path: "src/example.ts", user: { login: "github-actions[bot]" },
+    body: "**[high] Earlier finding**", html_url: "https://github.com/org/repo/pull/42#discussion_r51", ...overrides };
+}
+
+test("多数の既存指摘とUnicodeを含む要約も上限内で全状態・リンクと機械用状態を保持する", async t => {
+  const threads = Array.from({ length: 35 }, (_, index) => ({
+    ...ownThread(), id: `THREAD_${index}`, comment_id: 51 + index,
+  }));
+  const roots = threads.map(thread => ownRoot({ id: thread.comment_id,
+    html_url: `https://github.com/org/repo/pull/42#discussion_r${thread.comment_id}` }));
+  const value = evidenceReport({ prior_findings: threads.map((thread, index) => ({
+    thread_id: thread.id, status: ["still_present", "fixed", "uncertain"][index % 3],
+    body: `再評価${index} 日本語🎉\n` + "@".repeat(900), evidence_step_ids: [1],
+  })) });
+  const h = statefulHarness(value, { threads, roots });
+  assert.ok(Buffer.byteLength(h.options.reportJson) < 60000);
+  await h.run();
+  const bodies = [...h.submitted, ...h.summaries, ...h.replies].map(item => item.body);
+  for (const body of bodies) assert.ok(Buffer.byteLength(body) <= 60000);
+  const body = h.summaries[0].body;
+  for (const [index, thread] of threads.entries()) {
+    assert.ok(body.includes(`discussion_r${thread.comment_id}`));
+    assert.ok(body.includes(`再評価${index}`));
+  }
+  for (const status of ["未修正", "修正確認", "未確認"]) assert.ok(body.includes(status));
+  assert.ok(body.includes("調査未完了"));
+  assert.ok(body.includes("全文"));
+  assert.ok(body.includes("<!-- ai-review-summary:v1 -->"));
+  const state = JSON.parse(body.match(/<!-- ai-review-state:(\{[^\n]*\}) -->$/)[1]);
+  assert.equal(state.review_complete, false);
+  const saved = h.logs.find(line => line.startsWith("AI review full report: "));
+  assert.deepEqual(JSON.parse(saved.slice("AI review full report: ".length)), value);
+  t.diagnostic(`summary: ${Buffer.byteLength(body)}; largest reply: ${Math.max(...h.replies.map(item => Buffer.byteLength(item.body)))} UTF-8 bytes`);
+});
+
+test("正式レビューとインラインコメントにもUTF8上限を適用し、耐久マーカーを切らない", async t => {
+  const value = evidenceReport({ findings: Array.from({ length: 5 }, (_, index) => ({
+    ...finding(), title: `問題${index}🎉`, file: `src/fallback${index}.ts`,
+    body: "```text\n" + "@".repeat(2980) + "\n```",
+  })) });
+  const h = statefulHarness(value);
+  await h.run();
+  const request = h.submitted[0];
+  assert.ok(Buffer.byteLength(request.body) <= 60000);
+  assert.ok(request.body.includes("省略した説明の全文"));
+  const markers = [...request.body.matchAll(/<!-- ai-review-finding:[a-f0-9]{64} -->/g)];
+  assert.equal(markers.length, 5);
+  assert.match(request.body, /<!-- ai-review-state:\{[^\n]+\} -->$/);
+  const inline = statefulHarness(evidenceReport({ findings: [{ ...finding(), body: "🎉".repeat(3000) }] }));
+  await inline.run();
+  const comment = inline.submitted[0].comments[0];
+  assert.ok(Buffer.byteLength(comment.body) <= 60000);
+  assert.match(comment.body, /<!-- ai-review-finding:[a-f0-9]{64} -->$/);
+  t.diagnostic(`formal review: ${Buffer.byteLength(request.body)}; inline: ${Buffer.byteLength(comment.body)} UTF-8 bytes`);
+});
+
+test("100件の再評価と最長Unicodeパスでも指摘・未解決理由・状態を失わず投稿する", async t => {
+  const threads = Array.from({ length: 100 }, (_, index) => ({
+    ...ownThread(), id: `THREAD_${index}`, comment_id: 51 + index,
+  }));
+  const roots = threads.map(thread => ownRoot({ id: thread.comment_id,
+    html_url: `https://github.com/org/repo/pull/42#discussion_r${thread.comment_id}` }));
+  const value = evidenceReport({
+    findings: Array.from({ length: 5 }, (_, index) => ({ ...finding(),
+      title: `重大な問題${index}` + "🎉".repeat(190), file: `${index}${"🎉".repeat(499)}`,
+      body: "全文に残す根拠: " + "&".repeat(500),
+    })),
+    prior_findings: threads.map((thread, index) => ({ thread_id: thread.id,
+      status: "uncertain", body: `再評価${index}は未確認: ` + "@".repeat(150), evidence_step_ids: [],
+    })),
+    limitations: ["認証の確認が未完了です。"],
+    assessments: [{ ...evidenceReport().assessments[0], resolved: false, conclusion: "権限変更の影響が未確認です。" }],
+  });
+  const h = statefulHarness(value, { threads, roots });
+  assert.ok(Buffer.byteLength(h.options.reportJson) < 60000);
+  await h.run();
+  const body = h.summaries[0].body;
+  const allBodies = [...h.submitted, ...h.summaries, ...h.replies].map(item => item.body);
+  for (const text of allBodies) assert.ok(Buffer.byteLength(text) <= 60000);
+  for (const item of value.findings) {
+    assert.ok(body.includes(item.title));
+    assert.ok(body.includes(`${item.file}:L1`));
+  }
+  assert.ok(body.includes("認証の確認が未完了"));
+  assert.ok(body.includes("権限変更の影響が未確認"));
+  for (const [index, thread] of threads.entries()) {
+    assert.ok(body.includes(`再評価${index}は未確認`));
+    assert.ok(body.includes(`#discussion_r${thread.comment_id}`));
+  }
+  assert.equal(JSON.parse(body.match(/<!-- ai-review-state:(\{[^\n]*\}) -->$/)[1]).review_complete, false);
+  // A retry may find every fallback finding already posted and every old thread
+  // changed during analysis. Preserve each reason without duplicating warnings.
+  h.reviewComments.push(...threads.map(thread => ({
+    id: 5000 + thread.comment_id, in_reply_to_id: thread.comment_id,
+    user: { login: "human" }, body: "追加の確認事項です。",
+  })));
+  await h.run();
+  const updated = h.summaries[0].body;
+  assert.ok(Buffer.byteLength(updated) <= 60000);
+  for (const thread of threads) assert.ok(updated.includes(`#discussion_r${thread.comment_id}`));
+  assert.ok(updated.includes("調査後に議論が更新されたため"));
+  assert.ok(updated.includes("認証の確認が未完了"));
+  t.diagnostic(`100-thread summary: ${Buffer.byteLength(body)}; largest body: ${Math.max(...allBodies.map(text => Buffer.byteLength(text)))} UTF-8 bytes`);
+  t.diagnostic(`100 changed threads plus existing fallback findings: ${Buffer.byteLength(updated)} UTF-8 bytes`);
+});
+
+test("同じHeadの再実行は既存の要約を更新し正式レビューを重複させない", async () => {
+  const h = statefulHarness();
+  await h.run();
+  h.options.context.runId = 101;
+  h.options.runAttempt = "2";
+  await h.run();
+  assert.equal(h.summaries.length, 1);
+  assert.equal(h.submitted.length, 1);
+  assert.ok(h.summaries[0].body.includes("<!-- ai-review-summary:v1 -->"));
+  assert.ok(h.summaries[0].body.includes('"head_sha":"head123"'));
+});
+
+test("既存スレッドを再利用し人間の新しい返信があるときだけ同じ説明を返す", async () => {
+  const value = evidenceReport({ findings: [{ ...finding(), existing_thread_id: "THREAD_1" }],
+    prior_findings: [{ thread_id: "THREAD_1", status: "still_present", body: "問題は引き続き再現します。", evidence_step_ids: [1, 2] }] });
+  const h = statefulHarness(value, { threads: [ownThread()], roots: [ownRoot()] });
+  await h.run();
+  assert.equal(h.submitted[0]?.comments, undefined);
+  assert.ok(h.summaries[0].body.includes("discussion_r51"));
+  assert.equal(h.replies.length, 1);
+  h.options.context.runId++;
+  await h.run();
+  assert.equal(h.replies.length, 1);
+  h.reviewComments.push({ id: 9999, in_reply_to_id: 51, user: { login: "author" }, body: "なぜですか？" });
+  const snapshot = JSON.parse(h.options.reviewContext);
+  snapshot.threads[0].comments.push({ id: 9999, author: "author", body: "なぜですか？" });
+  h.options.reviewContext = JSON.stringify(snapshot);
+  h.options.context.runId++;
+  await h.run();
+  assert.equal(h.replies.length, 2);
+});
+
+test("未完了から完了への回復と新しいHeadの承認を投稿する", async () => {
+  const h = statefulHarness(evidenceReport({ review_complete: false }));
+  await h.run();
+  h.options.reportJson = JSON.stringify(evidenceReport());
+  h.options.runAttempt = "2";
+  await h.run();
+  assert.deepEqual(h.submitted.map(item => item.event), ["COMMENT", "APPROVE"]);
+  h.options.context.payload.pull_request.head.sha = "head456";
+  h.options.reportJson = JSON.stringify(evidenceReport({ reviewed_head_sha: "head456" }));
+  await h.run();
+  assert.equal(h.submitted.at(-1).commit_id, "head456");
+  assert.equal(h.submitted.length, 3);
+  assert.equal(h.summaries.length, 1);
+  h.options.context.payload.pull_request.base.sha = "base456";
+  await h.run();
+  assert.equal(h.submitted.length, 4);
+});
+
+test("他者のスレッドや偽のスレッド対応へ返信せず投稿前に拒否する", async () => {
+  for (const invalid of ["foreign", "binding", "missing"]) {
+    const value = evidenceReport({ prior_findings: [{ thread_id: "THREAD_1", status: "fixed", body: "修正を確認しました。", evidence_step_ids: [1] }] });
+    const h = statefulHarness(value, { threads: [ownThread()], roots: invalid === "missing" ? [] : [ownRoot(invalid === "foreign" ? { user: { login: "other" } } : {})] });
+    if (invalid === "binding") h.options.github.graphql = async () => ({ nodes: [{ id: "THREAD_1", comments: { nodes: [{ databaseId: 99 }] } }] });
+    await assert.rejects(h.run(), /thread|スレッド/);
+    assert.equal(h.replies.length, 0);
+    assert.equal(h.summaries.length, 0);
+    assert.equal(h.submitted.length, 0);
+  }
+});
+
+test("既存の指摘を省略しただけでは承認しない", async () => {
+  const h = statefulHarness(evidenceReport(), { threads: [ownThread()], roots: [ownRoot()] });
+  await h.run();
+  assert.equal(h.submitted[0].event, "COMMENT");
+  assert.ok(h.summaries[0].body.includes("再評価"));
+});
+
+test("レビュー投稿後に要約更新が失敗しても再試行で指摘を重複投稿しない", async () => {
+  const h = statefulHarness(evidenceReport({ findings: [finding()] }));
+  const create = h.options.github.rest.issues.createComment;
+  h.options.github.rest.issues.createComment = async () => { throw new Error("temporary failure"); };
+  await assert.rejects(h.run(), /temporary failure/);
+  assert.equal(h.submitted.length, 1);
+  h.options.github.rest.issues.createComment = create;
+  h.options.runAttempt = "2";
+  await h.run();
+  assert.equal(h.submitted.length, 1);
+  assert.equal(h.summaries.length, 1);
+  assert.equal(h.reviewComments.length, 1);
+});
+
+test("調査後の人間の返信には未読のまま返答せず承認を保留する", async () => {
+  const h = statefulHarness(evidenceReport({ prior_findings: [
+    { thread_id: "THREAD_1", status: "fixed", body: "修正を確認しました。", evidence_step_ids: [1] },
+  ] }), { threads: [ownThread()], roots: [ownRoot()] });
+  h.reviewComments.push({ id: 80, in_reply_to_id: 51, user: { login: "author" }, body: "別の条件ではまだ再現します。" });
+  await h.run();
+  assert.equal(h.replies.length, 0);
+  assert.equal(h.submitted[0].event, "COMMENT");
+  assert.ok(h.summaries[0].body.includes("新しい返信"));
+  assert.ok(!h.summaries[0].body.includes("[修正確認]"));
+  assert.ok(h.summaries[0].body.includes("既存の指摘 1件"));
+});
+
+test("修正後に同じ問題が再発したときは過去の返信と同じ文面でも更新する", async () => {
+  const prior = { thread_id: "THREAD_1", status: "still_present", body: "問題を確認しました。", evidence_step_ids: [1] };
+  const h = statefulHarness(evidenceReport({ prior_findings: [prior] }), { threads: [ownThread()], roots: [ownRoot()] });
+  await h.run();
+  h.options.reportJson = JSON.stringify(evidenceReport({ prior_findings: [{ ...prior, status: "fixed", body: "修正を確認しました。" }] }));
+  await h.run();
+  h.options.reportJson = JSON.stringify(evidenceReport({ prior_findings: [prior] }));
+  await h.run();
+  assert.equal(h.replies.length, 3);
+});
+
+test("切り詰められた議論と不正な過去指摘の根拠では承認しない", async () => {
+  const h = statefulHarness();
+  h.options.reviewContext = JSON.stringify({ ...JSON.parse(h.options.reviewContext), truncated: true });
+  await h.run();
+  assert.equal(h.submitted[0].event, "COMMENT");
+  const invalid = statefulHarness(evidenceReport({ prior_findings: [
+    { thread_id: "THREAD_1", status: "fixed", body: "修正しました。", evidence_step_ids: [99] },
+  ] }));
+  await assert.rejects(invalid.run(), /prior_findings.evidence/);
+  assert.equal(invalid.submitted.length, 0);
+});
+
+test("Dismissされたレビューを新しいレビューの重複とは扱わない", async () => {
+  const h = statefulHarness();
+  await h.run();
+  h.reviews[0].state = "DISMISSED";
+  h.options.context.runId++;
+  await h.run();
+  assert.equal(h.submitted.length, 2);
+});
+
+test("継続レビューでも古いHead・Baseへ返信や要約を書き込まない", async () => {
+  for (const change of [{ head: { sha: "changed" } }, { base: { sha: "changed" } }, { state: "closed" }]) {
+    const h = statefulHarness(evidenceReport({ prior_findings: [
+      { thread_id: "THREAD_1", status: "fixed", body: "修正しました。", evidence_step_ids: [1] },
+    ] }), { threads: [ownThread()], roots: [ownRoot()] });
+    const get = h.options.github.rest.pulls.get;
+    h.options.github.rest.pulls.get = async () => ({ data: { ...(await get()).data, ...change } });
+    assert.equal((await h.run()).published, false);
+    assert.equal(h.replies.length, 0);
+    assert.equal(h.summaries.length, 0);
+    assert.equal(h.submitted.length, 0);
+  }
+});
+
+test("他者が要約マーカーをコピーしても編集対象にしない", async () => {
+  const h = statefulHarness();
+  h.summaries.push({ id: 99, user: { login: "author" }, body: "<!-- ai-review-summary:v1 -->" });
+  await h.run();
+  assert.equal(h.summaries.length, 2);
+  assert.equal(h.summaries[0].body, "<!-- ai-review-summary:v1 -->");
+});
+
+test("Draftでは継続レビューもコメントに限定し公開後は承認に更新する", async () => {
+  const h = statefulHarness();
+  h.options.context.payload.pull_request.draft = true;
+  await h.run();
+  assert.equal(h.submitted[0].event, "COMMENT");
+  h.options.context.payload.pull_request.draft = false;
+  await h.run();
+  assert.equal(h.submitted[1].event, "APPROVE");
+  assert.equal(h.summaries.length, 1);
+});
+
+test("PRイベント以外でも調査時のPR番号とHead・Baseを照合して投稿する", async () => {
+  const h = statefulHarness(evidenceReport({ reviewed_head_sha: "a".repeat(40) }));
+  const live = h.options.context.payload.pull_request;
+  live.head.sha = "a".repeat(40);
+  live.base.sha = "b".repeat(40);
+  h.options.context.payload = { issue: { number: 42 } };
+  Object.assign(h.options, { pullRequestNumber: "42", headSha: live.head.sha, baseSha: live.base.sha });
+  await h.run();
+  assert.equal(h.submitted[0].pull_number, 42);
+  assert.equal(h.submitted[0].commit_id, "a".repeat(40));
+  assert.equal(h.options.context.payload.pull_request, undefined);
+});
+
+test("明示したPR番号にはHead・Baseが必要で変更済みなら投稿しない", async () => {
+  for (const change of [{ headSha: "" }, { baseSha: "" }, { pullRequestNumber: "42x" }]) {
+    const h = statefulHarness();
+    Object.assign(h.options, { pullRequestNumber: "42", headSha: "a".repeat(40), baseSha: "b".repeat(40) }, change);
+    await assert.rejects(h.run(), /head-shaとbase-sha/);
+    assert.equal(h.submitted.length, 0);
+  }
+  const h = statefulHarness();
+  Object.assign(h.options, { pullRequestNumber: "42", headSha: "a".repeat(40), baseSha: "b".repeat(40) });
+  assert.equal((await h.run()).published, false);
+  assert.equal(h.summaries.length, 0);
+});
+
+test("未調査の過去指摘は根拠なしのuncertainとして報告できるが承認しない", async () => {
+  const prior = { thread_id: "THREAD_1", status: "uncertain", body: "調査時間が足りず未確認です。", evidence_step_ids: [] };
+  const h = statefulHarness(evidenceReport({ review_complete: false, prior_findings: [prior] }),
+    { threads: [ownThread()], roots: [ownRoot()] });
+  await h.run();
+  assert.equal(h.submitted[0].event, "COMMENT");
+  assert.ok(h.replies[0].body.includes("根拠未取得"));
+  for (const status of ["fixed", "still_present"]) {
+    h.options.reportJson = JSON.stringify(evidenceReport({ prior_findings: [{ ...prior, status }] }));
+    await assert.rejects(h.run(), /prior_findings.evidence/);
+  }
+});
+
+test("調査後の一般コメントや他者のスレッドの変更でも承認を保留する", async () => {
+  for (const kind of ["issue", "review"]) {
+    const h = statefulHarness();
+    const comment = { id: 888, user: { login: "author" }, body: "受け入れ条件を追加しました。" };
+    if (kind === "issue") h.summaries.push(comment);
+    else h.reviewComments.push(comment);
+    await h.run();
+    assert.equal(h.submitted[0].event, "COMMENT");
+    assert.ok(h.summaries.at(-1).body.includes("最新の内容を再確認"));
+  }
+});
+
+test("64ビットの文字列スレッドIDをRESTの数値IDと正確に照合する", async () => {
+  const comment_id = 4294967296;
+  const h = statefulHarness(evidenceReport({ prior_findings: [
+    { thread_id: "THREAD_1", status: "fixed", body: "修正しました。", evidence_step_ids: [1] },
+  ] }), { threads: [{ ...ownThread(), comment_id }], roots: [ownRoot({ id: comment_id })] });
+  await h.run();
+  assert.equal(h.replies[0].comment_id, comment_id);
+});
+
+test("同じ状態の言い換えは返信せず同じIDの人間の返信が編集されたら返答する", async () => {
+  const prior = { thread_id: "THREAD_1", status: "still_present", body: "空の入力で失敗します。", evidence_step_ids: [1] };
+  const human = { id: 80, in_reply_to_id: 51, user: { login: "author" }, body: "空の入力も対応しますか？" };
+  const thread = { ...ownThread(), comments: [{ id: 80, author: "author", body: human.body }] };
+  const h = statefulHarness(evidenceReport({ prior_findings: [prior] }), { threads: [thread], roots: [ownRoot(), human] });
+  await h.run();
+  h.options.context.runId++;
+  h.options.reportJson = JSON.stringify(evidenceReport({ prior_findings: [{ ...prior, body: "入力が空の場合は引き続きエラーになります。" }] }));
+  await h.run();
+  assert.equal(h.replies.length, 1);
+  human.body = "空の入力では0を返すことにしました。";
+  const snapshot = JSON.parse(h.options.reviewContext);
+  snapshot.threads[0].comments[0].body = human.body;
+  h.options.reviewContext = JSON.stringify(snapshot);
+  h.options.context.runId++;
+  await h.run();
+  assert.equal(h.replies.length, 2);
+});
+
+test("ファイル一覧と議論だけを読んだレビューは完了と申告しても承認しない", async () => {
+  const investigation = [
+    { ...evidenceReport().investigation[0], command: "git diff --numstat", result: "1\t1\tsrc/example.ts" },
+    { ...evidenceReport().investigation[1], tool: "get_review_context", command: "get_review_context", exit_code: 0, result: "修正したとの返信です。" },
+  ];
+  const h = harness(evidenceReport({ investigation }));
+  assert.equal((await h.run()).event, "COMMENT");
+  for (const status of ["fixed", "still_present"]) {
+    const invalid = statefulHarness(evidenceReport({ investigation, prior_findings: [
+      { thread_id: "THREAD_1", status, body: "確認しました。", evidence_step_ids: [1, 2] },
+    ] }), { threads: [ownThread()], roots: [ownRoot()] });
+    await assert.rejects(invalid.run(), /prior_findings.code_evidence/);
+    assert.equal(invalid.replies.length, 0);
+  }
+});
+
+test("100件までの調査記録と全種類の根拠参照を受け入れ上限超過を拒否する", async () => {
+  const investigation = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1, tool: index ? "read_file" : "get_pull_request_diff", purpose: "Inspect source.",
+    command: "[omitted]", result: "[omitted]", exit_code: 0, code_evidence: true,
+  }));
+  const evidence_step_ids = investigation.map(step => step.id);
+  const value = evidenceReport({ investigation, assessments: [
+    { ...evidenceReport().assessments[0], evidence_step_ids },
+  ] });
+  assert.equal((await harness(value).run()).event, "APPROVE");
+  assert.equal((await harness({ ...value, findings: [{ ...finding(), evidence_step_ids }] }).run()).event, "REQUEST_CHANGES");
+  const prior = statefulHarness({ ...value, prior_findings: [
+    { thread_id: "THREAD_1", status: "fixed", body: "修正しました。", evidence_step_ids },
+  ] }, { threads: [ownThread()], roots: [ownRoot()] });
+  assert.equal((await prior.run()).event, "APPROVE");
+  const overLimit = harness({ ...value, investigation: [...investigation, { ...investigation[0], id: 101 }] });
+  await assert.rejects(overLimit.run(), /investigation/);
+  assert.equal(overLimit.apiCalls.length, 0);
+});
+
+test("圧縮された観測でもオーケストレーターのコード根拠フラグを検証する", async () => {
+  for (const override of [
+    { code_evidence: false }, { code_evidence: true, exit_code: 1 },
+    { code_evidence: true, tool: "get_review_context" },
+  ]) {
+    const value = evidenceReport({ investigation: [
+      { ...evidenceReport().investigation[0], ...override }, evidenceReport().investigation[1],
+    ] });
+    assert.equal((await harness(value).run()).event, "COMMENT");
+  }
+  for (const code_evidence of ["true", 1, null]) {
+    const h = harness(evidenceReport({ investigation: [
+      { ...evidenceReport().investigation[0], code_evidence }, evidenceReport().investigation[1],
+    ] }));
+    await assert.rejects(h.run(), /code_evidence/);
+    assert.equal(h.apiCalls.length, 0);
+  }
+});
+
+test("調査中にPRのタイトルや説明が変更された場合は返信も承認も投稿しない", async () => {
+  for (const changes of [{ title: "Different requirement" }, { body: "Use a different behavior." }]) {
+    const h = statefulHarness(evidenceReport({ prior_findings: [
+      { thread_id: "THREAD_1", status: "fixed", body: "修正しました。", evidence_step_ids: [1] },
+    ] }), { threads: [ownThread()], roots: [ownRoot()] });
+    const get = h.options.github.rest.pulls.get;
+    h.options.github.rest.pulls.get = async () => ({ data: { ...(await get()).data, ...changes } });
+    assert.equal((await h.run()).published, false);
+    assert.equal(h.submitted.length, 0);
+    assert.equal(h.replies.length, 0);
+    assert.equal(h.summaries.length, 0);
+  }
+});
+
+test("レビュー方針のdigestを保存し旧contextには方針を捏造しない", async () => {
+  for (const policy_digest of [undefined, "d".repeat(64)]) {
+    const h = statefulHarness();
+    const snapshot = JSON.parse(h.options.reviewContext);
+    if (policy_digest !== undefined) snapshot.policy_digest = policy_digest;
+    h.options.reviewContext = JSON.stringify(snapshot);
+    await h.run();
+    const state = JSON.parse(h.summaries[0].body.match(/<!-- ai-review-state:(\{[^\n]*\}) -->$/)[1]);
+    assert.equal(state.policy_digest, policy_digest);
+    assert.equal(Object.hasOwn(state, "policy_digest"), policy_digest !== undefined);
+  }
+  for (const policy_digest of [null, "", "invalid", "D".repeat(64)]) {
+    const h = statefulHarness();
+    h.options.reviewContext = JSON.stringify({ ...JSON.parse(h.options.reviewContext), policy_digest });
+    await assert.rejects(h.run(), /policy_digest/);
+    assert.equal(h.submitted.length, 0);
+    assert.equal(h.summaries.length, 0);
+  }
 });
