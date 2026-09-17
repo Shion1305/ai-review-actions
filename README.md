@@ -14,8 +14,8 @@ Dockerサンドボックス内で行います。
 
 ## 使い方
 
-checkoutにはBaseとHeadの両方のコミットが必要です。次の例のActionリビジョンは説明用です。
-本番ワークフローでは、検証済みの完全なコミットSHAへ固定してください。
+checkoutにはBaseとHeadの両方のコミットが必要です。現在は開発段階のため、
+3つのActionは`main`を参照し、実行時に最新の実装を取得します。
 
 ```yaml
 name: AI PR Review
@@ -23,10 +23,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
 permissions: {}
-concurrency:
-  group: ai-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
+# ai-review-actionsは開発段階のため、mainを参照して常に最新の実装を適用する。
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -46,7 +43,7 @@ jobs:
       skip-review: ${{ steps.context.outputs.skip-review }}
     steps:
       - id: context
-        uses: ynufes-tech/ai-review-actions/context@v2
+        uses: ynufes-tech/ai-review-actions/context@main
         with:
           pull-request-number: ${{ github.event.pull_request.number }}
           review-profile: model=gemini-3.8-flash;language=ja;network=none;budgets=default;mcp=none;policy=1
@@ -56,6 +53,9 @@ jobs:
     if: needs.prepare.outputs.skip-review != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: ai-review-analyze-${{ github.workflow }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     permissions:
       contents: read
     outputs:
@@ -70,7 +70,7 @@ jobs:
           path: source
 
       - id: review
-        uses: ynufes-tech/ai-review-actions@v2
+        uses: ynufes-tech/ai-review-actions@main
         with:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
           repository: ${{ github.repository }}
@@ -85,10 +85,13 @@ jobs:
     needs: [prepare, analyze]
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    concurrency:
+      group: ai-review-publish-${{ github.workflow }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     permissions:
       pull-requests: write
     steps:
-      - uses: ynufes-tech/ai-review-actions/publish@v2
+      - uses: ynufes-tech/ai-review-actions/publish@main
         with:
           report: ${{ needs.analyze.outputs.report }}
           review-context: ${{ needs.prepare.outputs.context }}
@@ -97,10 +100,11 @@ jobs:
           base-sha: ${{ needs.prepare.outputs.base-sha }}
 ```
 
-3つのActionを同じ検証済みコミットSHAへ固定してください。GitHub Appを使う場合は、
-`context`と`publish`の両方に同じ`reviewer-login`を指定します。上の例はpush等で動く最小構成です。
+3つのActionは同じ参照を使用してください。GitHub Appを使う場合は、`context`と`publish`の
+両方に同じ`reviewer-login`を指定します。上の例はpush等で動く最小構成です。
 `review-profile`はモデル・レビュー方針・上限・MCP等を識別する秘密情報を含まない文字列です。
-設定を変更したら更新してください。Actionのリビジョンと併せて、古い条件の完了結果を再利用しないために使います。
+設定を変更したら更新してください。取得したAction実装の内容ハッシュと併せて、古い条件の完了結果を再利用しないために使います。
+`main`の名前が同じでも実装が変わると、前回の完了結果を再利用せずPR全体を調査します。
 返信イベントや手動実行を追加する際の対象判定・権限・競合制御は[イベントの設計](docs/review-architecture.md#イベントと権限)を参照してください。
 
 モデルが生成するレビュー文の既定言語は日本語です。モデル生成文を別の言語にする場合は
@@ -224,7 +228,7 @@ checkoutやモデル生成コマンドの実行を行いません。
           permission-pull-requests: write
 
       - name: GitHub App名義でレビューを投稿
-        uses: ynufes-tech/ai-review-actions/publish@v2
+        uses: ynufes-tech/ai-review-actions/publish@main
         with:
           report: ${{ needs.analyze.outputs.report }}
           github-token: ${{ steps.app-token.outputs.token }}
@@ -322,7 +326,7 @@ GitHub ActionsによるPR承認を許可してください。GitHub App名義の
 未確認・未評価の指摘が残る場合や、調査中に議論が変わった場合は承認しません。
 
 完了したレビューのHeadを次回の差分基点に使います。Base変更や祖先関係の不成立時は全体比較へ戻り、
-古い未解決の指摘も再調査します。同じHead・Base・議論・Draft状態・Actionリビジョン・
+古い未解決の指摘も再調査します。同じHead・Base・議論・Draft状態・Action実装の内容ハッシュ・
 `review-profile`の完了済みレビューは省略します。
 `context`の`full-review: "true"`で、スキップと前回Headの再利用を無効にできます。
 
@@ -333,7 +337,7 @@ GitHub上の過去の変更要求は残るため、解消後の承認または�
 
 ## v1からの移行
 
-調査Actionと投稿Actionを同じv2のコミットSHAへ更新してください。入力名・ジョブ分離・
+調査Actionと投稿Actionを、v2形式に対応した同じ参照（現在は`main`）へ更新してください。入力名・ジョブ分離・
 調査コンテナの権限削除とジョブ分離は維持しています。JSON出力は`schema_version: 2`となり、旧`checks`を
 `investigation`、`assessments`、`verification_rationale`、`not_run_checks`へ置き換えています。
 独自にJSONを読む処理がある場合は対応が必要です。
@@ -387,7 +391,7 @@ JSONが40 KBを超える場合は観測のコマンド・目的・結果の抜�
 
 次の例は[Context7](https://github.com/upstash/context7)のライブラリ文書検索と、
 [GitHub MCP](https://github.com/github/github-mcp-server)のPR・Issue参照を有効にします。
-調査Actionと`publish`は、この機能に対応した同じコミットSHAへ更新してください。
+調査Actionと`publish`は、この機能に対応した同じ参照（現在は`main`）を使用してください。
 
 ```yaml
 with:
@@ -552,9 +556,9 @@ checkoutの内容を送信するリスクは残ります。秘密鍵をコンテ
 事前構築済みの独自イメージは`sandbox-image`で指定できます。`public`で使う場合は
 `sh`、`iptables`、`ip6tables`が必要です。イメージは信頼できる供給元のdigestへ固定してください。
 
-指定したActionリビジョンのコードは、権限を持つオーケストレーター内で実行されます。信頼できる
-コミットへ固定し、fork由来のワークフローへSecretを渡さず、レビュー対象のcheckoutでは
-`persist-credentials: false`を使用してください。
+指定したAction参照のコードは、権限を持つオーケストレーター内で実行されます。現在の`main`参照は
+このリポジトリへの更新を信頼して取り込む設定です。fork由来のワークフローへSecretを渡さず、
+レビュー対象のcheckoutでは`persist-credentials: false`を使用してください。
 
 ## 開発
 

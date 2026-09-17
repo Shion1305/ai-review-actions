@@ -1,8 +1,11 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } = require("node:fs");
+const { tmpdir } = require("node:os");
+const { dirname, join } = require("node:path");
 const { test } = require("node:test");
-const { collectContext } = require("../context/index.cjs");
+const { collectContext, implementationRevision, assertImplementationRevision } = require("../context/index.cjs");
 
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
@@ -271,6 +274,88 @@ test("local calls have a stable versioned policy when actionRevision is omitted"
   assert.match(initial.policy_digest, /^[a-f0-9]{64}$/);
   assert.equal(JSON.parse(result.contextJson).policy_digest, initial.policy_digest);
   assert.equal(result.skipReview, true);
+});
+
+test("source identity remains the downloaded implementation even with a custom policy revision", async () => {
+  const snapshot = JSON.parse((await harness({ policy: { actionRevision: "custom-test-revision" } }).run()).contextJson);
+  assert.equal(snapshot.source_digest, implementationRevision());
+  assert.match(snapshot.source_digest, /^[a-f0-9]{64}$/);
+});
+
+function implementationFixture(t, reverse = false) {
+  const root = mkdtempSync(join(tmpdir(), "ai-review-implementation-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const names = [
+    "action.yml", "context/action.yml", "context/index.cjs", "publish/action.yml", "publish/index.cjs",
+    "pyproject.toml", "uv.lock", "src/review.py", "src/model_io.py", "src/external_context.py",
+    "sandbox/Dockerfile", "sandbox/network-policy.sh",
+  ];
+  for (const name of reverse ? [...names].reverse() : names) {
+    mkdirSync(dirname(join(root, name)), { recursive: true });
+    writeFileSync(join(root, name), `example content for ${name}\n`);
+  }
+  return { root, names };
+}
+
+test("downloaded implementation content invalidates cached reviews even under the same moving ref", async t => {
+  const { root, names } = implementationFixture(t);
+  const originalRevision = implementationRevision(root);
+  const initial = JSON.parse((await harness({ policy: { actionRevision: originalRevision } }).run()).contextJson);
+  assert.match(originalRevision, /^[a-f0-9]{64}$/);
+  for (const name of names) {
+    const file = join(root, name);
+    const original = readFileSync(file);
+    writeFileSync(file, Buffer.concat([original, Buffer.from("changed implementation\n")]));
+    const revision = implementationRevision(root);
+    assert.notEqual(revision, originalRevision, name);
+    for (const head_sha of [HEAD, OLD_HEAD]) {
+      const result = await harness({
+        policy: { actionRevision: revision }, comments: [sticky(initial, { head_sha })],
+      }).run();
+      assert.equal(result.skipReview, false, name);
+      assert.equal(result.reviewBaseSha, BASE, name);
+      assert.equal(JSON.parse(result.contextJson).previous_head_sha, null, name);
+    }
+    writeFileSync(file, original);
+  }
+});
+
+test("implementation identity is deterministic and ignores generated and unrelated files", t => {
+  const first = implementationFixture(t);
+  const second = implementationFixture(t, true);
+  const revision = implementationRevision(first.root);
+  assert.equal(implementationRevision(second.root), revision);
+  for (const name of ["README.md", "tests/test_example.py", ".env", ".venv/runtime.py",
+    "src/__pycache__/review.pyc", "src/.env", "src/.cache/generated.py"]) {
+    mkdirSync(dirname(join(first.root, name)), { recursive: true });
+    writeFileSync(join(first.root, name), "not action implementation");
+  }
+  assert.equal(implementationRevision(first.root), revision);
+  writeFileSync(join(first.root, "src/extra.py"), "new runtime module");
+  assert.notEqual(implementationRevision(first.root), revision);
+});
+
+test("missing required files and source symlinks fail instead of hashing a partial implementation", t => {
+  const { root } = implementationFixture(t);
+  unlinkSync(join(root, "src/review.py"));
+  assert.throws(() => implementationRevision(root), { code: "ENOENT" });
+  const outside = join(root, ".env");
+  writeFileSync(outside, "never follow this symlink");
+  symlinkSync(outside, join(root, "src/review.py"));
+  assert.throws(() => implementationRevision(root), /must be a regular file/i);
+});
+
+test("cross-job source checks accept matching or legacy context and reject changed implementations", t => {
+  const { root } = implementationFixture(t);
+  const snapshot = { source_digest: implementationRevision(root) };
+  assert.doesNotThrow(() => assertImplementationRevision(snapshot, root));
+  assert.doesNotThrow(() => assertImplementationRevision(JSON.stringify(snapshot), root));
+  assert.doesNotThrow(() => assertImplementationRevision("{}", root));
+  for (const source_digest of [null, "", "main", "A".repeat(64)]) {
+    assert.throws(() => assertImplementationRevision({ source_digest }, root), /invalid source_digest/i);
+  }
+  writeFileSync(join(root, "src/review.py"), "new action downloaded by the next job");
+  assert.throws(() => assertImplementationRevision(snapshot, root), /implementation changed/i);
 });
 
 test("missing policy profiles and explicit empty action revisions fail before API calls", async () => {

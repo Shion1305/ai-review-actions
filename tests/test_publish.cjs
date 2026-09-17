@@ -917,3 +917,26 @@ test("レビュー方針のdigestを保存し旧contextには方針を捏造し�
     assert.equal(h.summaries.length, 0);
   }
 });
+
+test("取得後にActionの実装が変わった場合はGitHub APIを呼ぶ前に投稿を停止する", async () => {
+  const { implementationRevision } = require("../context/index.cjs");
+  for (const source_digest of [null, "invalid", "A".repeat(64), "0".repeat(64)]) {
+    const h = statefulHarness();
+    h.options.reviewContext = JSON.stringify({ ...JSON.parse(h.options.reviewContext), source_digest });
+    await assert.rejects(h.run(), /source_digest|implementation changed/);
+    assert.deepEqual(h.apiCalls, []);
+    assert.equal(h.submitted.length + h.summaries.length + h.replies.length, 0);
+  }
+  const valid = statefulHarness();
+  valid.options.reviewContext = JSON.stringify({
+    ...JSON.parse(valid.options.reviewContext), source_digest: implementationRevision(),
+  });
+  assert.equal((await valid.run()).published, true);
+
+  const explicit = statefulHarness();
+  Object.assign(explicit.options, { pullRequestNumber: "42", headSha: "a".repeat(40), baseSha: "b".repeat(40),
+    reviewContext: JSON.stringify({ ...JSON.parse(explicit.options.reviewContext), source_digest: "0".repeat(64) }),
+  });
+  await assert.rejects(explicit.run(), /implementation changed/);
+  assert.deepEqual(explicit.apiCalls, []);
+});

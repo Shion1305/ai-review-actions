@@ -91,6 +91,16 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: 議論の取得時とActionの実装が一致することを確認
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      env:
+        AI_REVIEW_ACTION_PATH: ${{ github.action_path }}
+        REVIEW_CONTEXT: ${{ inputs.review-context }}
+      with:
+        script: |
+          const { assertImplementationRevision } = require(process.env.AI_REVIEW_ACTION_PATH + "/context/index.cjs");
+          assertImplementationRevision(process.env.REVIEW_CONTEXT);
+
     - name: uvをインストール
       uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       with:

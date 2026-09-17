@@ -1,6 +1,8 @@
 "use strict";
 
 const { createHash } = require("node:crypto");
+const { lstatSync, readdirSync, readFileSync } = require("node:fs");
+const { join, resolve } = require("node:path");
 
 const SUMMARY_MARKER = "<!-- ai-review-summary:v1 -->";
 const MAX_CONTEXT_BYTES = 30000;
@@ -9,6 +11,50 @@ const MAX_THREADS = 20;
 const MAX_COMMENTS = 10;
 // Bump when cache or context-selection semantics change, including direct local calls.
 const POLICY_VERSION = 1;
+const REQUIRED_IMPLEMENTATION_FILES = [
+  "action.yml", "context/action.yml", "context/index.cjs", "publish/action.yml", "publish/index.cjs",
+  "pyproject.toml", "uv.lock", "src/review.py", "src/model_io.py", "src/external_context.py",
+  "sandbox/Dockerfile", "sandbox/network-policy.sh",
+];
+
+function implementationRevision(root = resolve(__dirname, "..")) {
+  const files = new Set(REQUIRED_IMPLEMENTATION_FILES);
+  const collect = (directory, include) => {
+    for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
+      if (entry.name.startsWith(".") || ["__pycache__", "node_modules"].includes(entry.name)) continue;
+      const relative = `${directory}/${entry.name}`;
+      if (entry.isSymbolicLink()) throw new Error(`Implementation path must be a regular file or directory: ${relative}`);
+      if (entry.isDirectory()) collect(relative, include);
+      else if (include(entry.name)) files.add(relative);
+    }
+  };
+  collect("src", name => name.endsWith(".py"));
+  collect("sandbox", name => name === "Dockerfile" || name.endsWith(".sh"));
+  for (const directory of ["context", "publish"]) {
+    collect(directory, name => /\.(?:cjs|mjs|js|yml|yaml)$/.test(name));
+  }
+  const manifest = [...files].sort().map(relative => {
+    const file = join(root, relative);
+    if (!lstatSync(file).isFile()) throw new Error(`Implementation path must be a regular file: ${relative}`);
+    return [relative, createHash("sha256").update(readFileSync(file)).digest("hex")];
+  });
+  return createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+}
+
+function assertImplementationRevision(snapshotOrJson, root) {
+  const snapshot = typeof snapshotOrJson === "string" ? JSON.parse(snapshotOrJson) : snapshotOrJson;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new Error("Invalid review context for the implementation check.");
+  }
+  if (snapshot.source_digest === undefined) return;
+  if (typeof snapshot.source_digest !== "string" || !/^[a-f0-9]{64}$/.test(snapshot.source_digest)) {
+    throw new Error("Invalid source_digest in review context.");
+  }
+  if (snapshot.source_digest !== implementationRevision(root)) {
+    throw new Error("The action implementation changed since context collection; collect fresh context before continuing.");
+  }
+}
+
 const QUERY = `query AIReviewContext($owner: String!, $repo: String!, $number: Int!,
   $threadsBefore: String, $commentsBefore: String,
   $fetchThreads: Boolean!, $fetchComments: Boolean!) {
@@ -84,7 +130,7 @@ function validateTarget(pr, repository, number) {
 }
 
 async function collectContext({ github, context, core, repository, pullRequestNumber,
-  reviewerLogin = "github-actions[bot]", fullReview = false, reviewProfile, actionRevision = "local" }) {
+  reviewerLogin = "github-actions[bot]", fullReview = false, reviewProfile, actionRevision }) {
   if (typeof repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
       repository.split("/").some(part => part === "." || part === "..")) {
     throw new Error("Invalid repository; use owner/name.");
@@ -98,6 +144,8 @@ async function collectContext({ github, context, core, repository, pullRequestNu
       Buffer.byteLength(reviewProfile, "utf8") > 4096 || reviewProfile.includes("\u0000")) {
     throw new Error("review-profile must be a nonempty configuration identity of at most 4096 bytes.");
   }
+  const sourceDigest = implementationRevision();
+  if (actionRevision === undefined) actionRevision = sourceDigest;
   if (typeof actionRevision !== "string" || !actionRevision.trim() ||
       Buffer.byteLength(actionRevision, "utf8") > 512 || actionRevision.includes("\u0000")) {
     throw new Error("The action revision must be a nonempty reference of at most 512 bytes.");
@@ -212,7 +260,7 @@ async function collectContext({ github, context, core, repository, pullRequestNu
     })),
     comments: comments.slice(0, MAX_COMMENTS).map(clipComment),
     previous_head_sha: complete ? state.head_sha : null,
-    context_digest: digest, policy_digest: policyDigest, truncated,
+    context_digest: digest, policy_digest: policyDigest, source_digest: sourceDigest, truncated,
   };
   const size = () => Buffer.byteLength(JSON.stringify(result), "utf8");
   if (size() > MAX_CONTEXT_BYTES) {
@@ -237,4 +285,4 @@ async function collectContext({ github, context, core, repository, pullRequestNu
   };
 }
 
-module.exports = { collectContext };
+module.exports = { collectContext, implementationRevision, assertImplementationRevision };

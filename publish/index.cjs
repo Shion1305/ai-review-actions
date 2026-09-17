@@ -1,11 +1,18 @@
 "use strict";
 
 const { createHash } = require("node:crypto");
+const { assertImplementationRevision } = require("../context/index.cjs");
 const MAX_INVESTIGATION_STEPS = 100;
 const MAX_BODY_BYTES = 60000;
 
 async function publishReview({ github, context, core, reportJson, model, runAttempt, serverUrl,
   reviewerLogin = "github-actions[bot]", reviewContext = "", pullRequestNumber = "", headSha = "", baseSha = "" }) {
+  if (reviewContext) {
+    if (typeof reviewContext !== "string" || Buffer.byteLength(reviewContext, "utf8") > 250000) {
+      throw new Error("review-context: invalid or oversized JSON");
+    }
+    assertImplementationRevision(reviewContext);
+  }
   if (pullRequestNumber !== "") {
     if (!/^[1-9][0-9]*$/.test(String(pullRequestNumber)) || !Number.isSafeInteger(Number(pullRequestNumber)) ||
         !/^[a-f0-9]{40}$/i.test(headSha) || !/^[a-f0-9]{40}$/i.test(baseSha)) {
