@@ -65,7 +65,11 @@ class ReviewSessionTest(unittest.TestCase):
             def execute(self, command, timeout_seconds=120):
                 if command[:2] == ["sed", "-n"]:
                     self.calls.append((command, timeout_seconds))
-                    body = "earlier-evidence-marker" if "old.py" in command else "recent evidence"
+                    body = (
+                        "earlier-evidence-marker"
+                        if "old.py" in command
+                        else "recent evidence\n" * 350
+                    )
                     return review.CommandResult(0, body, "")
                 return super().execute(command, timeout_seconds)
 
@@ -557,7 +561,13 @@ class ReviewSessionTest(unittest.TestCase):
 
         self.assertEqual(page()["next_index"], 5)
         self.assertEqual([t["id"] for t in page(start_index=5)["threads"]], ["T5", "T6"])
-        self.assertEqual(page(section="description")["next_index"], 1000)
+        self.assertEqual(
+            page(section="description", body_start=1000)["body"], "remaining requirements"
+        )
+        self.assertEqual(page(section="description")["next_body_start"], 1000)
+        self.assertIsNone(page(section="description", body_start=1000)["next_body_start"])
+        with self.assertRaises(review.ModelRetry):
+            page(section="description", start_index=1000, body_start=2000)
         self.assertEqual(
             page(section="description", start_index=1000)["body"], "remaining requirements"
         )

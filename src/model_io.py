@@ -78,8 +78,11 @@ def truncate_utf8(text: str, limit: int, marker: str = _COMPACTION_MARKER) -> st
     return encoded[:prefix_limit].decode("utf-8", errors="ignore") + suffix
 
 
-def _rolling_history(messages: list[ModelMessage]) -> list[ModelMessage]:
-    """Keep four complete cycles and persist only an index of older observations."""
+def _rolling_history(messages: list[ModelMessage], message_budget_bytes: int) -> list[ModelMessage]:
+    """Archive oldest complete cycles only when serialized history needs room."""
+    original_size = len(ModelMessagesTypeAdapter.dump_json(messages))
+    if original_size <= message_budget_bytes:
+        return messages
     index_message = None
     history: list[ModelMessage] = []
     for message in messages:
@@ -90,10 +93,8 @@ def _rolling_history(messages: list[ModelMessage]) -> list[ModelMessage]:
         else:
             history.append(message)
     response_indices = [i for i, m in enumerate(history) if isinstance(m, ModelResponse)]
-    if len(response_indices) <= 4:
+    if len(response_indices) < 2:
         return messages
-    first_response = response_indices[0]
-    cut = response_indices[-4]
     call_positions = {
         part.tool_call_id: index
         for index, message in enumerate(history)
@@ -111,10 +112,13 @@ def _rolling_history(messages: list[ModelMessage]) -> list[ModelMessage]:
     pending_positions = [
         position for call_id, position in call_positions.items() if call_id not in returned_ids
     ]
-    cut = min([cut, *pending_positions])
-    # Deferred returns and output-validation retries can span message boundaries.
-    # Widen the retained window rather than orphaning a tool result or signature.
-    while True:
+    smallest = messages
+    smallest_size = original_size
+    # Every candidate keeps the initial request and at least the latest cycle.
+    # Never split deferred returns or output-validation retries from their calls.
+    for cut in response_indices[1:]:
+        if any(position < cut for position in pending_positions):
+            continue
         references = [
             call_positions[part.tool_call_id]
             for message in history[cut:]
@@ -123,13 +127,26 @@ def _rolling_history(messages: list[ModelMessage]) -> list[ModelMessage]:
             if isinstance(part, ToolReturnPart | RetryPromptPart)
             and part.tool_call_id in call_positions
         ]
-        expanded = min([cut, *references])
-        if expanded == cut:
-            break
-        cut = expanded
-    if cut <= first_response:
-        return messages
+        if any(position < cut for position in references):
+            continue
+        candidate = _archive_history(history, index_message, response_indices[0], cut)
+        size = len(ModelMessagesTypeAdapter.dump_json(candidate))
+        if size <= message_budget_bytes:
+            return candidate
+        if size < smallest_size:
+            smallest, smallest_size = candidate, size
+    # Fixed initial context or a pending protocol pair may exceed the target.
+    # The complete-request guard rejects an oversized request before network IO.
+    return smallest
 
+
+def _archive_history(
+    history: list[ModelMessage],
+    index_message: ModelRequest | None,
+    first_response: int,
+    cut: int,
+) -> list[ModelMessage]:
+    """Replace an old prefix with bounded metadata, without copying old output."""
     snapshot: dict[str, Any] = {
         "archived_count": 0,
         "first_step_id": None,
@@ -191,28 +208,35 @@ def _rolling_history(messages: list[ModelMessage]) -> list[ModelMessage]:
     return [*history[:first_response], new_index, *history[cut:]]
 
 
-def compact_history(messages: list[ModelMessage], *, review_notes: str = "") -> list[ModelMessage]:
-    """Keep initial context, four recent cycles and a 6 KB archive index.
+def compact_history(
+    messages: list[ModelMessage],
+    *,
+    review_notes: str = "",
+    message_budget_bytes: int = 64000,
+) -> list[ModelMessage]:
+    """Preserve useful turns until serialized messages reach their byte target.
 
     Old assistant prose, thought signatures and tool output leave model context
-    together with their complete cycles. Retained calls, returns and signatures
-    remain paired. Full observations live in ReviewTools' separate archive and
-    can be recalled on demand; the index never includes raw old output. Inputs
-    are copied rather than mutated. Optional working notes replace the previous
-    note block, remain user-level hypotheses, and include their label within a
-    separate 6 KB byte cap.
+    together with their complete cycles when necessary. Retained tool results
+    keep up to 6 KB regardless of age. Calls, returns and signatures remain paired.
+    Full observations live in ReviewTools' separate archive and can be recalled
+    on demand; its 6 KB index never includes raw old output. Inputs are copied
+    rather than mutated. Optional working notes replace the previous note block,
+    remain user-level hypotheses, and include their label within a 6 KB byte cap.
+    The initial request and latest cycle are preserved even if they alone exceed
+    the target; BoundedReviewModel independently enforces the full request ceiling.
     """
+    if message_budget_bytes <= 0:
+        raise ValueError("The history message byte budget must be positive.")
     copied = copy.deepcopy(messages)
-    compacted = _rolling_history(
-        [
-            message
-            for message in copied
-            if not (
-                isinstance(message, ModelRequest)
-                and (message.metadata or {}).get("review_working_notes")
-            )
-        ]
-    )
+    compacted = [
+        message
+        for message in copied
+        if not (
+            isinstance(message, ModelRequest)
+            and (message.metadata or {}).get("review_working_notes")
+        )
+    ]
     if review_notes:
         notes = _NOTES_HEADER + truncate_utf8(
             review_notes, 6000 - len(_NOTES_HEADER.encode("utf-8"))
@@ -232,14 +256,13 @@ def compact_history(messages: list[ModelMessage], *, review_notes: str = "") -> 
         for part in message.parts
         if isinstance(part, ToolReturnPart)
     ]
-    for index, part in enumerate(results):
-        limit = 6000 if index >= len(results) - 2 else 500
+    for part in results:
         content = part.model_response_str(wrap_if_error=False)
         evidence_id = re.search(r"\[step_id=\d+\]", content)
         if evidence_id and not content.startswith(evidence_id.group()):
             content = evidence_id.group() + "\n" + content
-        part.content = truncate_utf8(content, limit)
-    return compacted
+        part.content = truncate_utf8(content, 6000)
+    return _rolling_history(compacted, message_budget_bytes)
 
 
 def request_input_bytes(
@@ -337,16 +360,24 @@ class BoundedReviewModel(WrapperModel):
                 now = self._monotonic()
                 while self._reservations and self._reservations[0][0] <= now - 60.0:
                     self._reservations.popleft()
-                wait = 0.0
+                interval_wait = 0.0
                 if self._last_request is not None:
-                    wait = max(0.0, self._last_request + self.min_request_interval - now)
+                    interval_wait = max(0.0, self._last_request + self.min_request_interval - now)
                 used = sum(reserved_size for _, reserved_size in self._reservations)
+                window_wait = 0.0
                 if used + size > self.input_bytes_per_minute:
-                    wait = max(wait, self._reservations[0][0] + 60.0 - now)
+                    window_wait = self._reservations[0][0] + 60.0 - now
+                wait = max(interval_wait, window_wait)
                 if wait <= 0:
                     self._reservations.append((now, size))
                     self._last_request = now
                     return
+                reason = "+".join(
+                    name
+                    for name, seconds in (("interval", interval_wait), ("window", window_wait))
+                    if seconds > 0
+                )
+                logger.info("Model pacing wait_seconds=%.3f reason=%s", wait, reason)
                 await self._wait(wait, budget)
 
     async def request(
@@ -386,11 +417,18 @@ class BoundedReviewModel(WrapperModel):
                 usage = response.usage
                 logger.info(
                     "Model response input_tokens=%d output_tokens=%d "
-                    "cache_read_tokens=%d cache_write_tokens=%d",
+                    "cache_read_tokens=%d cache_write_tokens=%d tool_names=%s",
                     usage.input_tokens,
                     usage.output_tokens,
                     usage.cache_read_tokens,
                     usage.cache_write_tokens,
+                    json.dumps(
+                        [
+                            part.tool_name
+                            for part in response.parts
+                            if isinstance(part, ToolCallPart)
+                        ]
+                    ),
                 )
                 return response
         raise AssertionError("Unreachable model retry state")
