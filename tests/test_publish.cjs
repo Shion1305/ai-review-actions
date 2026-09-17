@@ -763,6 +763,38 @@ test("PRイベント以外でも調査時のPR番号とHead・Baseを照合し�
   assert.equal(h.options.context.payload.pull_request, undefined);
 });
 
+test("github-scriptのprototype getterのrepoを明示したPR番号の投稿でも保持する", async () => {
+  class ActionsContext {
+    constructor() {
+      this.payload = { issue: { number: 42 }, repository: { owner: { login: "org" }, name: "repo" } };
+      this.runId = 100;
+    }
+    get repo() {
+      return { owner: this.payload.repository.owner.login, repo: this.payload.repository.name };
+    }
+  }
+  for (const withReviewContext of [false, true]) {
+    const h = statefulHarness(evidenceReport({ reviewed_head_sha: "a".repeat(40),
+      findings: [{ ...finding(), file: "src/fallback.ts" }],
+    }));
+    const live = h.options.context.payload.pull_request;
+    live.head.sha = "a".repeat(40);
+    live.base.sha = "b".repeat(40);
+    const context = new ActionsContext();
+    assert.equal(Object.hasOwn(context, "repo"), false);
+    Object.assign(h.options, { context, pullRequestNumber: "42", headSha: live.head.sha, baseSha: live.base.sha });
+    if (!withReviewContext) h.options.reviewContext = "";
+    assert.equal((await h.run()).published, true);
+    assert.equal(h.submitted[0].owner, "org");
+    assert.equal(h.submitted[0].repo, "repo");
+    assert.equal(h.submitted[0].pull_number, 42);
+    assert.ok(h.submitted[0].body.includes("https://github.com/org/repo/actions/runs/100"));
+    assert.equal(context.payload.pull_request, undefined);
+    assert.equal(h.options.context, context);
+    if (withReviewContext) assert.equal(h.summaries[0].owner, "org");
+  }
+});
+
 test("明示したPR番号にはHead・Baseが必要で変更済みなら投稿しない", async () => {
   for (const change of [{ headSha: "" }, { baseSha: "" }, { pullRequestNumber: "42x" }]) {
     const h = statefulHarness();

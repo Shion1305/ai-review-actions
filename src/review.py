@@ -1109,6 +1109,9 @@ alternative methods mean the review is incomplete.
 Command exit codes and success counts are not review verdicts. Reading a file successfully
 does not prove correctness; a missing optional tool or an empty search does not prove a bug
 or incomplete investigation. Even passing tests require interpretation of their relevance.
+Before claiming tests ran, verify the test script or runner and its actual output. Dependency
+installation output alone is not a test result, even if a command named "test" exits zero.
+Describe only the checks actually performed; loading file text is not parsing or validating it.
 Do not ignore failing tests: establish whether they show a regression, a pre-existing issue,
 or an unresolved question. Do not mask failures with constructs such as "|| true".
 Only put genuinely necessary, unrun validation that alternatives have not covered into

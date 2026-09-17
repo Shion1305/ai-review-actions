@@ -23,7 +23,9 @@ async function publishReview({ github, context, core, reportJson, model, runAtte
       core.notice("PRが更新またはクローズされたため、古いレビューの投稿を中止しました。");
       return { published: false };
     }
-    context = { ...context, payload: { ...context.payload, pull_request: live } };
+    // github-script's Context exposes repo through a prototype getter, which
+    // object spread does not copy. Keep its resolved value in this local view.
+    context = { ...context, repo: context.repo, payload: { ...context.payload, pull_request: live } };
   }
   const pr = context.payload.pull_request;
   if (!pr) throw new Error("pull_requestイベントのコンテキストが必要です。");
