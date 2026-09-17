@@ -1,4 +1,4 @@
-"""Bound review context and pace complete requests, including provider retries.
+"""Bound review context and retry transient provider failures.
 
 The byte budgets cover serialized messages, settings, instructions and tool schemas.
 They are conservative local budgets, not provider token counts or account-wide quotas.
@@ -12,8 +12,6 @@ import json
 import logging
 import math
 import re
-import time
-from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -225,10 +223,20 @@ def compact_history(
     remain user-level hypotheses, and include their label within a 6 KB byte cap.
     The initial request and latest cycle are preserved even if they alone exceed
     the target; BoundedReviewModel independently enforces the full request ceiling.
+    Repeated request instructions retain only their newest identical copy. This
+    removes SDK history bookkeeping; current instruction parts remain unchanged.
     """
     if message_budget_bytes <= 0:
         raise ValueError("The history message byte budget must be positive.")
     copied = copy.deepcopy(messages)
+    seen_instructions: set[str] = set()
+    for message in reversed(copied):
+        if not isinstance(message, ModelRequest) or message.instructions is None:
+            continue
+        if message.instructions in seen_instructions:
+            message.instructions = None
+        else:
+            seen_instructions.add(message.instructions)
     compacted = [
         message
         for message in copied
@@ -316,10 +324,10 @@ class _WaitBudget:
 
 
 class BoundedReviewModel(WrapperModel):
-    """Limit request size and traffic without rerunning tools during retries.
+    """Limit request size and retry transient errors without rerunning tools.
 
-    Reservations count every attempted network request, including failed attempts.
-    Limits are per review process; independent CI jobs may share a provider quota.
+    Successful requests have no artificial delay. Retry waits honor provider
+    guidance and are bounded per request, alongside the maximum attempt count.
     """
 
     def __init__(
@@ -327,24 +335,13 @@ class BoundedReviewModel(WrapperModel):
         wrapped: Model,
         *,
         max_input_bytes: int = 96000,
-        input_bytes_per_minute: int = 384000,
-        min_request_interval: float = 5.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__(wrapped)
-        if max_input_bytes <= 0 or input_bytes_per_minute <= 0:
-            raise ValueError("Model input byte budgets must be positive.")
-        if not math.isfinite(min_request_interval) or min_request_interval < 0:
-            raise ValueError("The minimum request interval must be finite and nonnegative.")
+        if max_input_bytes <= 0:
+            raise ValueError("The model input byte budget must be positive.")
         self.max_input_bytes = max_input_bytes
-        self.input_bytes_per_minute = input_bytes_per_minute
-        self.min_request_interval = min_request_interval
         self._sleep = sleep
-        self._monotonic = monotonic
-        self._reservations: deque[tuple[float, int]] = deque()
-        self._last_request: float | None = None
-        self._reservation_lock = asyncio.Lock()
 
     async def _wait(self, seconds: float, budget: _WaitBudget) -> None:
         if seconds <= 0:
@@ -354,32 +351,6 @@ class BoundedReviewModel(WrapperModel):
         budget.remaining -= seconds
         await self._sleep(seconds)
 
-    async def _reserve(self, size: int, budget: _WaitBudget) -> None:
-        async with self._reservation_lock:
-            while True:
-                now = self._monotonic()
-                while self._reservations and self._reservations[0][0] <= now - 60.0:
-                    self._reservations.popleft()
-                interval_wait = 0.0
-                if self._last_request is not None:
-                    interval_wait = max(0.0, self._last_request + self.min_request_interval - now)
-                used = sum(reserved_size for _, reserved_size in self._reservations)
-                window_wait = 0.0
-                if used + size > self.input_bytes_per_minute:
-                    window_wait = self._reservations[0][0] + 60.0 - now
-                wait = max(interval_wait, window_wait)
-                if wait <= 0:
-                    self._reservations.append((now, size))
-                    self._last_request = now
-                    return
-                reason = "+".join(
-                    name
-                    for name, seconds in (("interval", interval_wait), ("window", window_wait))
-                    if seconds > 0
-                )
-                logger.info("Model pacing wait_seconds=%.3f reason=%s", wait, reason)
-                await self._wait(wait, budget)
-
     async def request(
         self,
         messages: list[ModelMessage],
@@ -387,14 +358,13 @@ class BoundedReviewModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         size = request_input_bytes(messages, model_settings, model_request_parameters)
-        if size > min(self.max_input_bytes, self.input_bytes_per_minute):
+        if size > self.max_input_bytes:
             raise UsageLimitExceeded(
                 "The model request exceeded the configured input byte budget. "
                 "Narrow the review scope or tool observations."
             )
         budget = _WaitBudget()
         for attempt in range(3):
-            await self._reserve(size, budget)
             logger.info("Model request attempt=%d serialized_input_bytes=%d", attempt + 1, size)
             try:
                 response = await self.wrapped.request(

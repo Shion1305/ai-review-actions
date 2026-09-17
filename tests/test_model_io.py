@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 import unittest
+from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 
 import httpx2
@@ -26,6 +29,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
@@ -54,6 +58,23 @@ class FakeClock:
 
 
 class HistoryTest(unittest.TestCase):
+    def test_duplicate_instructions_keep_latest_distinct_policy_without_mutating_history(self):
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart("Review")], instructions="policy A"),
+            ModelResponse(parts=[TextPart("First")]),
+            ModelRequest(parts=[UserPromptPart("Continue")], instructions="policy B"),
+            ModelResponse(parts=[TextPart("Second")]),
+            ModelRequest(parts=[UserPromptPart("Continue")], instructions="policy A"),
+        ]
+        original = ModelMessagesTypeAdapter.dump_json(messages)
+        compacted = compact_history(messages)
+        requests = [m for m in compacted if isinstance(m, ModelRequest)]
+        self.assertIsNone(requests[0].instructions)
+        self.assertEqual(requests[1].instructions, "policy B")
+        self.assertEqual(requests[2].instructions, "policy A")
+        self.assertEqual(ModelMessagesTypeAdapter.dump_json(messages), original)
+        self.assertEqual(compact_history([messages[0]]), [messages[0]])
+
     def test_related_pages_remain_complete_while_history_fits_budget(self) -> None:
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("Review")])]
         for index in range(8):
@@ -221,9 +242,130 @@ class HistoryTest(unittest.TestCase):
 class ModelIOTest(unittest.IsolatedAsyncioTestCase):
     def model(self, function, clock=None, **kwargs):
         clock = clock or FakeClock()
-        return BoundedReviewModel(
-            FunctionModel(function), sleep=clock.sleep, monotonic=clock.now, **kwargs
+        return BoundedReviewModel(FunctionModel(function), sleep=clock.sleep, **kwargs)
+
+    async def test_instruction_deduplication_does_not_change_google_wire_request(self):
+        wire_requests = []
+
+        def handler(request):
+            wire_requests.append(json.loads(request.content))
+            return httpx2.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "done"}]},
+                            "finishReason": "STOP",
+                        }
+                    ]
+                },
+            )
+
+        messages: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart("Review")], instructions="fixed policy"),
+            ModelResponse(parts=[ToolCallPart("read_file", {"path": "app.py"}, "call-1")]),
+            ModelRequest(
+                parts=[ToolReturnPart("read_file", "[step_id=1] source", "call-1")],
+                instructions="fixed policy",
+            ),
+        ]
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+            model = GoogleModel(
+                "gemini-3.8-flash",
+                provider=GoogleProvider(api_key="test-only-key", http_client=client),
+            )
+            # Normal Agent requests supply instruction_parts; direct model calls
+            # can instead use the SDK's fallback to the latest request instructions.
+            for instructions in ([InstructionPart("fixed policy")], None):
+                parameters = ModelRequestParameters(instruction_parts=instructions)
+                await model.request(messages, None, parameters)
+                await model.request(compact_history(messages), None, parameters)
+                self.assertEqual(wire_requests[-2], wire_requests[-1])
+                self.assertEqual(
+                    wire_requests[-1]["systemInstruction"]["parts"], [{"text": "fixed policy"}]
+                )
+
+    def test_real_review_prompt_retains_more_pages_without_repeated_instruction_bookkeeping(self):
+        import test_review
+
+        review = test_review.review
+        metrics = []
+
+        class SourceSandbox(test_review.CheckoutSandbox):
+            def execute(self, command, timeout_seconds=120):
+                if command[:2] == ["sed", "-n"]:
+                    self.calls.append((command, timeout_seconds))
+                    return review.CommandResult(0, "def checked(value): return value\n" * 125, "")
+                return super().execute(command, timeout_seconds)
+
+        class Capture(WrapperModel):
+            async def request(self, messages, model_settings, model_request_parameters):
+                metrics.append(
+                    {
+                        "history_bytes": len(ModelMessagesTypeAdapter.dump_json(messages)),
+                        "full_bytes": request_input_bytes(
+                            messages, model_settings, model_request_parameters
+                        ),
+                        "cycles": sum(isinstance(m, ModelResponse) for m in messages),
+                        "instructions": [
+                            m.instructions
+                            for m in messages
+                            if isinstance(m, ModelRequest) and m.instructions is not None
+                        ],
+                    }
+                )
+                return await self.wrapped.request(
+                    messages, model_settings, model_request_parameters
+                )
+
+        def respond(_messages, info):
+            turn = len(metrics)
+            if turn <= 12:
+                return ModelResponse(
+                    [
+                        ToolCallPart(
+                            "read_file",
+                            {
+                                "path": "source.py",
+                                "start_line": 1 + (turn - 1) * 125,
+                                "end_line": turn * 125,
+                            },
+                        )
+                    ]
+                )
+            return ModelResponse(
+                [
+                    ToolCallPart(
+                        info.output_tools[0].name,
+                        {
+                            "review_complete": False,
+                            "summary": "Diagnostic complete.",
+                            "limitations": ["Synthetic diagnostic does not complete a review."],
+                            "findings": [],
+                        },
+                    )
+                ]
+            )
+
+        config = replace(
+            test_review.ReviewPromptTest().config(),
+            review_context={
+                "description": "Synthetic requirements.",
+                "threads": [],
+                "comments": [],
+            },
         )
+        with redirect_stdout(io.StringIO()):
+            result = review.review_pull_request(
+                config, SourceSandbox(), model=Capture(FunctionModel(respond))
+            )
+        self.assertEqual(len(result.investigation), 12)
+        self.assertEqual(len(metrics), 13)
+        self.assertGreaterEqual(metrics[-1]["cycles"], 8)
+        for request in metrics:
+            self.assertLessEqual(request["history_bytes"], 64000)
+            self.assertLessEqual(request["full_bytes"], 96000)
+            self.assertEqual(request["instructions"], [review.SYSTEM_INSTRUCTIONS.strip()])
 
     async def test_google_wire_schema_simplifies_array_bounds_without_relaxing_local_limits(self):
         from review import ReviewDraft
@@ -476,7 +618,23 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.output, "Finished")
         self.assertEqual(tool_runs, [1])
         self.assertEqual(calls[1], calls[2])
-        self.assertEqual(clock.sleeps, [5.0, 12.5])
+        self.assertEqual(clock.sleeps, [12.5])
+
+    async def test_successful_sequential_requests_have_no_artificial_wait(self):
+        clock = FakeClock()
+        calls = []
+
+        def respond(_messages, _info):
+            calls.append(clock.now())
+            return ModelResponse(parts=[TextPart("done")])
+
+        model = self.model(respond, clock)
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("source " * 8000)])]
+        for _ in range(12):
+            await model.request(messages, None, ModelRequestParameters())
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(calls, [0.0] * 12)
 
     async def test_oversized_schema_or_instructions_rejected_before_network(self) -> None:
         calls = []
@@ -502,7 +660,7 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
                 await model.request(request_messages, None, parameters)
         self.assertEqual(calls, [])
 
-    async def test_sliding_minute_budget_counts_retry_attempts(self) -> None:
+    async def test_retry_after_is_honored_without_other_waits(self) -> None:
         clock = FakeClock()
         calls = []
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("hello")])]
@@ -515,18 +673,12 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
                 raise ModelHTTPError(429, "fake", headers={"Retry-After": "7"})
             return ModelResponse(parts=[TextPart("done")])
 
-        model = self.model(
-            respond,
-            clock,
-            max_input_bytes=size,
-            input_bytes_per_minute=size,
-            min_request_interval=0,
-        )
+        model = self.model(respond, clock, max_input_bytes=size)
         with self.assertLogs("model_io", level="INFO") as logs:
             await model.request(messages, None, parameters)
-        self.assertEqual(calls, [0.0, 60.0])
-        self.assertEqual(clock.sleeps, [7.0, 53.0])
-        self.assertIn("Model pacing wait_seconds=53.000 reason=window", "\n".join(logs.output))
+        self.assertEqual(calls, [0.0, 7.0])
+        self.assertEqual(clock.sleeps, [7.0])
+        self.assertIn("Model retry delay_seconds=7.000", "\n".join(logs.output))
 
     async def test_settings_output_schema_and_instruction_parts_count_toward_budget(self) -> None:
         calls = []
@@ -567,7 +719,7 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("input_tokens=11 output_tokens=4 cache_read_tokens=7", output)
         self.assertNotIn("private-source", output)
 
-    async def test_response_tool_names_and_pacing_are_logged_without_arguments_or_reasoning(self):
+    async def test_response_tool_names_are_logged_without_arguments_or_reasoning(self):
         def respond(_messages, _info):
             return ModelResponse(
                 parts=[
@@ -591,7 +743,6 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             'tool_names=["read_observation", "save_review_notes", "escaped\\nname"]', output
         )
-        self.assertIn("Model pacing wait_seconds=5.000 reason=interval", output)
         self.assertNotIn("private-", output)
 
     async def test_exhausted_429_becomes_safe_usage_limit(self) -> None:
@@ -618,6 +769,19 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
             await Agent(self.model(respond, clock)).run("Review")
         self.assertEqual(calls, [1])
         self.assertEqual(clock.sleeps, [])
+
+    async def test_retry_waits_share_one_bounded_total(self):
+        clock = FakeClock()
+        calls = []
+
+        def respond(_messages, _info):
+            calls.append(1)
+            raise ModelHTTPError(429, "fake", headers={"Retry-After": "100"})
+
+        with self.assertRaises(UsageLimitExceeded):
+            await Agent(self.model(respond, clock)).run("Review")
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(clock.sleeps, [100.0])
 
     async def test_only_transient_provider_failures_are_retried(self) -> None:
         for status in [400, 401, 403, 404, 500, 502, 503]:

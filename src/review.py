@@ -116,7 +116,6 @@ class ReviewConfig:
     review_context: dict[str, Any] = field(default_factory=dict, repr=False)
     review_base_sha: str = ""
     model_input_byte_limit: int = 96_000
-    model_input_bytes_per_minute: int = 384_000
     model_output_token_limit: int = 8_192
 
     @classmethod
@@ -150,17 +149,12 @@ class ReviewConfig:
             review_context=parse_review_context(os.environ.get("REVIEW_CONTEXT", "{}")),
             review_base_sha=os.environ.get("REVIEW_INCREMENTAL_BASE_SHA", ""),
             model_input_byte_limit=int(os.environ.get("REVIEW_MODEL_INPUT_BYTE_LIMIT", "96000")),
-            model_input_bytes_per_minute=int(
-                os.environ.get("REVIEW_MODEL_INPUT_BYTES_PER_MINUTE", "384000")
-            ),
             model_output_token_limit=int(os.environ.get("REVIEW_MODEL_OUTPUT_TOKEN_LIMIT", "8192")),
         )
         if config.review_base_sha and not re.fullmatch(r"[0-9a-f]{40}", config.review_base_sha):
             raise ValueError("review-base-sha must be a full commit SHA")
         if not 32_000 <= config.model_input_byte_limit <= 256_000:
             raise ValueError("model-input-byte-limit must be between 32000 and 256000")
-        if not config.model_input_byte_limit <= config.model_input_bytes_per_minute <= 4_000_000:
-            raise ValueError("per-minute byte budget must cover one request and not exceed 4000000")
         if not 2_048 <= config.model_output_token_limit <= 16_384:
             raise ValueError("model-output-token-limit must be between 2048 and 16384")
         if config.pull_request_number < 1:
@@ -831,6 +825,18 @@ class ReviewTools:
         code_evidence: bool = False,
     ) -> str:
         self.check_budget()
+        print(
+            "AI tool start: "
+            + json.dumps(
+                {
+                    "tool": tool,
+                    "command": shlex.join(command),
+                    "timeout_seconds": timeout_seconds,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         result = self._sandbox.execute(command, timeout_seconds)
         content = result.stdout.strip()
         if tool == "get_pull_request_diff":
@@ -1181,7 +1187,6 @@ def review_pull_request(
             ),
         ),
         max_input_bytes=config.model_input_byte_limit,
-        input_bytes_per_minute=config.model_input_bytes_per_minute,
     )
     agent: Agent[None, ReviewDraft] = Agent(
         agent_model,

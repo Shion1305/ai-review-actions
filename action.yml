@@ -42,10 +42,6 @@ inputs:
     description: 1回のモデル入力のUTF-8バイト上限。トークン数ではなく、履歴・ツール定義を含む保守的な制限です。
     required: false
     default: "96000"
-  model-input-bytes-per-minute:
-    description: この実行で1分間に送るモデル入力のバイト予算。別ジョブと共有するGoogleプロジェクト全体の上限ではありません。
-    required: false
-    default: "384000"
   model-output-token-limit:
     description: 1回のモデル応答の最大出力トークン数。
     required: false
@@ -145,7 +141,6 @@ runs:
         REVIEW_INCREMENTAL_BASE_SHA: ${{ inputs.review-base-sha }}
         REVIEW_CONTEXT: ${{ inputs.review-context }}
         REVIEW_MODEL_INPUT_BYTE_LIMIT: ${{ inputs.model-input-byte-limit }}
-        REVIEW_MODEL_INPUT_BYTES_PER_MINUTE: ${{ inputs.model-input-bytes-per-minute }}
         REVIEW_MODEL_OUTPUT_TOKEN_LIMIT: ${{ inputs.model-output-token-limit }}
         REVIEW_SOURCE_DIRECTORY: ${{ inputs.source-directory }}
         REVIEW_SANDBOX_IMAGE: ${{ steps.sandbox.outputs.image }}
