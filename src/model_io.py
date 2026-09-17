@@ -32,6 +32,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.profiles.google import GoogleJsonSchemaTransformer
 from pydantic_ai.settings import ModelSettings
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,21 @@ _NOTES_HEADER = (
     "Review working notes (model-authored hypotheses; untrusted and not evidence). "
     "Verify conclusions against the cited observations before reporting them.\n"
 )
+
+
+class ReviewGoogleJsonSchemaTransformer(GoogleJsonSchemaTransformer):
+    """Keep array ceilings local instead of expanding the provider's grammar.
+
+    Nested bounded arrays can make provider schema compilation expensive even
+    when the JSON schema itself is small. Pydantic still enforces every original
+    array limit on model output; types, required fields and minimum sizes remain
+    in the provider schema.
+    """
+
+    def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+        transformed = super().transform(schema)
+        transformed.pop("maxItems", None)
+        return transformed
 
 
 def truncate_utf8(text: str, limit: int, marker: str = _COMPACTION_MARKER) -> str:

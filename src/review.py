@@ -22,7 +22,7 @@ from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
 
 from external_context import MCPServerConfig, build_mcp_toolsets, parse_mcp_settings
-from model_io import BoundedReviewModel, compact_history
+from model_io import BoundedReviewModel, ReviewGoogleJsonSchemaTransformer, compact_history
 
 
 def parse_review_context(raw: str) -> dict[str, Any]:
@@ -1161,6 +1161,7 @@ def review_pull_request(
     agent_model = model or BoundedReviewModel(
         GoogleModel(
             config.model,
+            profile={"json_schema_transformer": ReviewGoogleJsonSchemaTransformer},
             provider=GoogleProvider(
                 api_key=config.api_key,
                 retry_options=HttpRetryOptions(attempts=1),

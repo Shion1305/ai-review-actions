@@ -5,6 +5,9 @@ import sys
 import unittest
 from pathlib import Path
 
+import httpx2
+from google.genai.types import HttpRetryOptions
+from pydantic import ValidationError
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
@@ -22,12 +25,19 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from model_io import BoundedReviewModel, compact_history, request_input_bytes  # noqa: E402
+from model_io import (  # noqa: E402
+    BoundedReviewModel,
+    ReviewGoogleJsonSchemaTransformer,
+    compact_history,
+    request_input_bytes,
+)
 
 
 class FakeClock:
@@ -163,6 +173,94 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
         return BoundedReviewModel(
             FunctionModel(function), sleep=clock.sleep, monotonic=clock.now, **kwargs
         )
+
+    async def test_google_wire_schema_simplifies_array_bounds_without_relaxing_local_limits(self):
+        from review import ReviewDraft
+
+        requests = []
+        output = {
+            "review_complete": False,
+            "summary": "Inspection is incomplete.",
+            "limitations": ["No source inspected."],
+            "findings": [],
+        }
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx2.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {"functionCall": {"name": "final_result", "args": output}}
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 8,
+                        "totalTokenCount": 18,
+                    },
+                },
+            )
+
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+            model = GoogleModel(
+                "gemini-3.8-flash",
+                provider=GoogleProvider(
+                    api_key="test-only-key",
+                    http_client=client,
+                    retry_options=HttpRetryOptions(attempts=1),
+                ),
+                profile={"json_schema_transformer": ReviewGoogleJsonSchemaTransformer},
+            )
+            self.assertTrue(model.profile.get("google_supports_tool_combination"))
+            self.assertTrue(model.profile.get("google_supports_thinking_level"))
+            agent = Agent(
+                BoundedReviewModel(model),
+                output_type=ReviewDraft,
+                model_settings=GoogleModelSettings(temperature=0.1, max_tokens=8192),
+            )
+            result = await agent.run("Return an incomplete review without inventing evidence.")
+        self.assertEqual(result.output.summary, output["summary"])
+        self.assertEqual(len(requests), 1)
+        definitions = [d for tool in requests[0]["tools"] for d in tool["functionDeclarations"]]
+        schema = next(
+            d["parameters_json_schema"] for d in definitions if d["name"] == "final_result"
+        )
+
+        def keys(value):
+            if isinstance(value, dict):
+                return set(value) | set().union(*(keys(v) for v in value.values()))
+            if isinstance(value, list):
+                return set().union(*(keys(v) for v in value))
+            return set()
+
+        self.assertNotIn("maxItems", keys(schema))
+        self.assertIn("minItems", keys(schema))
+        self.assertIn("required", keys(schema))
+        self.assertIn("enum", keys(schema))
+        self.assertEqual(requests[0]["generationConfig"]["maxOutputTokens"], 8192)
+        self.assertEqual(requests[0]["toolConfig"]["functionCallingConfig"]["mode"], "ANY")
+        invalid = {
+            **output,
+            "assessments": [
+                {
+                    "question": "Check the change",
+                    "conclusion": "Pending",
+                    "resolved": False,
+                    "evidence_step_ids": [1] * 101,
+                }
+            ],
+        }
+        with self.assertRaises(ValidationError) as caught:
+            ReviewDraft.model_validate(invalid)
+        self.assertEqual(caught.exception.errors()[0]["type"], "too_long")
 
     async def test_real_agent_compacts_repeated_large_results(self) -> None:
         request_sizes = []
