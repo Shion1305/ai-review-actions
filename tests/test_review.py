@@ -530,13 +530,8 @@ class ReviewPromptTest(unittest.TestCase):
 
 
 class ReviewConfigTest(unittest.TestCase):
-    def test_rejects_unrestricted_network_modes(self) -> None:
-        for network in ["host", "bridge", "", "invalid"]:
-            with self.assertRaisesRegex(ValueError, "network must be none or public"):
-                review.DockerSandbox(Path("."), "node:test", network=network)
-
-    def test_rejects_limits_above_the_action_ceiling(self) -> None:
-        environment = {
+    def environment(self) -> dict[str, str]:
+        return {
             "REVIEW_REPOSITORY": "owner/repository",
             "REVIEW_PULL_REQUEST_NUMBER": "42",
             "REVIEW_BASE_SHA": "base123",
@@ -546,6 +541,65 @@ class ReviewConfigTest(unittest.TestCase):
             "REVIEW_SOURCE_DIRECTORY": "/checkout",
             "REVIEW_SANDBOX_IMAGE": "node:test",
             "REVIEW_LANGUAGE": "日本語",
+            "REVIEW_REQUEST_LIMIT": "120",
+            "REVIEW_TOOL_CALL_LIMIT": "100",
+            "REVIEW_INVESTIGATION_TOOL_LIMIT": "80",
+        }
+
+    def test_parses_ordered_google_and_openai_fallback_models(self) -> None:
+        self.assertEqual(review.parse_fallback_models("[]", "gemini-test"), ())
+        self.assertEqual(
+            review.parse_fallback_models(
+                '["gemini-lite", "google:gemini-stable", "openai:gpt-5-nano"]',
+                "gemini-test",
+            ),
+            (
+                review.ModelSpec("google", "gemini-lite"),
+                review.ModelSpec("google", "gemini-stable"),
+                review.ModelSpec("openai", "gpt-5-nano"),
+            ),
+        )
+
+    def test_rejects_invalid_fallback_model_configuration(self) -> None:
+        cases = [
+            ("not-json", "valid JSON array"),
+            ('{"model":"gemini-lite"}', "JSON array"),
+            ('[""]', "non-empty"),
+            ('[" openai:gpt-5-nano"]', "whitespace"),
+            ('["anthropic:claude"]', "unsupported provider"),
+            ('["gemini-a", "google:gemini-a"]', "duplicate"),
+            (
+                '["gemini-a", "gemini-b", "gemini-c", "gemini-d", "gemini-e", "gemini-f"]',
+                "at most 5",
+            ),
+        ]
+        for raw, message in cases:
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, message):
+                review.parse_fallback_models(raw, "gemini-test")
+
+    def test_rejects_primary_model_repeated_as_explicit_google_fallback(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            review.parse_fallback_models('["google:gemini-test"]', "gemini-test")
+
+    def test_reads_optional_fallback_models_and_openai_key_from_environment(self) -> None:
+        environment = self.environment() | {
+            "REVIEW_FALLBACK_MODELS": '["openai:gpt-5-nano"]',
+            "OPENAI_API_KEY": "openai-secret",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            config = review.ReviewConfig.from_env()
+
+        self.assertEqual(config.fallback_models, (review.ModelSpec("openai", "gpt-5-nano"),))
+        self.assertEqual(config.openai_api_key, "openai-secret")
+
+    def test_rejects_unrestricted_network_modes(self) -> None:
+        for network in ["host", "bridge", "", "invalid"]:
+            with self.assertRaisesRegex(ValueError, "network must be none or public"):
+                review.DockerSandbox(Path("."), "node:test", network=network)
+
+    def test_rejects_limits_above_the_action_ceiling(self) -> None:
+        environment = self.environment() | {
             "REVIEW_REQUEST_LIMIT": "241",
             "REVIEW_TOOL_CALL_LIMIT": "30",
             "REVIEW_INVESTIGATION_TOOL_LIMIT": "24",

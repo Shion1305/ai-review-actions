@@ -97,6 +97,54 @@ InvestigationTool = Literal[
 
 
 @dataclass(frozen=True)
+class ModelSpec:
+    provider: Literal["google", "openai"]
+    name: str
+
+
+def _parse_model_spec(value: str) -> ModelSpec:
+    if not value or value != value.strip():
+        raise ValueError(
+            "fallback model names must be non-empty and contain no surrounding whitespace"
+        )
+    if any(character.isspace() for character in value):
+        raise ValueError("fallback model names must not contain whitespace")
+    if ":" not in value:
+        return ModelSpec("google", value)
+    provider, name = value.split(":", 1)
+    if provider not in {"google", "openai"}:
+        raise ValueError(f"unsupported provider in fallback model: {provider}")
+    if not name:
+        raise ValueError("fallback model names must be non-empty")
+    return ModelSpec(provider, name)  # type: ignore[arg-type]
+
+
+def parse_fallback_models(raw: str, primary_model: str) -> tuple[ModelSpec, ...]:
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError("fallback-models must be a valid JSON array") from None
+    if not isinstance(values, list):
+        raise ValueError("fallback-models must be a JSON array")
+    if len(values) > 5:
+        raise ValueError("fallback-models must contain at most 5 models")
+
+    primary = _parse_model_spec(primary_model)
+    seen = {(primary.provider, primary.name)}
+    parsed: list[ModelSpec] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("fallback-models entries must be strings")
+        spec = _parse_model_spec(value)
+        identity = (spec.provider, spec.name)
+        if identity in seen:
+            raise ValueError(f"duplicate fallback model: {value}")
+        seen.add(identity)
+        parsed.append(spec)
+    return tuple(parsed)
+
+
+@dataclass(frozen=True)
 class ReviewConfig:
     repository: str
     pull_request_number: int
@@ -106,6 +154,8 @@ class ReviewConfig:
     api_key: str = field(repr=False)
     source_dir: Path
     sandbox_image: str
+    fallback_models: tuple[ModelSpec, ...] = ()
+    openai_api_key: str = field(default="", repr=False)
     sandbox_network: str = "none"
     review_language: str = "日本語"
     request_limit: int = DEFAULT_REQUEST_LIMIT
@@ -139,6 +189,10 @@ class ReviewConfig:
             api_key=required("GEMINI_API_KEY"),
             source_dir=Path(required("REVIEW_SOURCE_DIRECTORY")),
             sandbox_image=required("REVIEW_SANDBOX_IMAGE"),
+            fallback_models=parse_fallback_models(
+                os.environ.get("REVIEW_FALLBACK_MODELS", "[]"), required("REVIEW_MODEL")
+            ),
+            openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
             sandbox_network=os.environ.get("REVIEW_SANDBOX_NETWORK", "none"),
             review_language=required("REVIEW_LANGUAGE"),
             request_limit=int(required("REVIEW_REQUEST_LIMIT")),
