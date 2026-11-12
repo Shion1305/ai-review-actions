@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
 from google.genai.types import HttpRetryOptions
+from openai import AsyncOpenAI
 from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
 from pydantic_ai import Agent, FallbackExceptionGroup, ModelRetry, UsageLimitExceeded, UsageLimits
 from pydantic_ai.capabilities import ProcessHistory
@@ -1249,7 +1250,12 @@ def build_review_model(config: ReviewConfig) -> Model[Any]:
                 raise ValueError("openai-api-key is required for OpenAI fallback models")
             concrete = OpenAIResponsesModel(
                 spec.name,
-                provider=OpenAIProvider(api_key=config.openai_api_key),
+                provider=OpenAIProvider(
+                    openai_client=AsyncOpenAI(
+                        api_key=config.openai_api_key,
+                        max_retries=0,
+                    )
+                ),
             )
         models.append(BoundedReviewModel(concrete, max_input_bytes=config.model_input_byte_limit))
 

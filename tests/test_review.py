@@ -664,6 +664,18 @@ class ReviewModelFactoryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "openai-api-key"):
                 review.build_review_model(config)
 
+    def test_openai_fallback_disables_sdk_retries(self) -> None:
+        config = self.config(
+            fallback_models=(review.ModelSpec("openai", "gpt-5-nano"),),
+            openai_api_key="explicit-openai-secret",
+        )
+
+        model = review.build_review_model(config)
+
+        assert isinstance(model, FallbackModel)
+        openai_model = model.models[1].wrapped
+        self.assertEqual(openai_model.client.max_retries, 0)
+
 
 class FailureSummaryTest(unittest.TestCase):
     def failure(self) -> FallbackExceptionGroup:

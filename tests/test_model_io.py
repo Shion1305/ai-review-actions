@@ -264,6 +264,29 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(model_io.is_transient_model_error(UsageLimitExceeded("local limit")))
         self.assertFalse(model_io.is_transient_model_error(RuntimeError("unrelated")))
 
+    def test_timeout_exception_groups_are_classified_conservatively(self) -> None:
+        self.assertTrue(
+            model_io.is_transient_model_error(
+                ExceptionGroup("provider", [TimeoutError("provider timed out")])
+            )
+        )
+        self.assertFalse(
+            model_io.is_transient_model_error(
+                ExceptionGroup(
+                    "provider",
+                    [TimeoutError("provider timed out"), RuntimeError("unrelated")],
+                )
+            )
+        )
+
+        unrelated_wrapper = RuntimeError("unrelated")
+        unrelated_wrapper.__cause__ = TimeoutError("provider timed out")
+        self.assertFalse(model_io.is_transient_model_error(unrelated_wrapper))
+
+        local_limit = UsageLimitExceeded("local limit")
+        local_limit.__cause__ = TimeoutError("provider timed out")
+        self.assertFalse(model_io.is_transient_model_error(local_limit))
+
     async def test_transient_continuation_failure_falls_back_without_rerunning_tool(self) -> None:
         primary_calls: list[bytes] = []
         fallback_calls: list[bytes] = []

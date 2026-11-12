@@ -20,7 +20,7 @@ import httpx
 import httpx2
 from openai import APITimeoutError
 from pydantic import TypeAdapter
-from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -68,30 +68,35 @@ class ReviewGoogleJsonSchemaTransformer(GoogleJsonSchemaTransformer):
 
 def is_transient_model_error(error: Exception) -> bool:
     """Return whether another configured model may safely handle this request."""
-    if isinstance(error, ModelHTTPError):
-        eligible = error.status_code == 429 or 500 <= error.status_code <= 599
-        if eligible:
-            logger.warning(
-                "Model fallback eligible model=%s status=%d",
-                error.model_name,
-                error.status_code,
-            )
-        return eligible
-
-    current: BaseException | None = error
-    visited: set[int] = set()
     timeout_types = (TimeoutError, httpx.TimeoutException, httpx2.TimeoutException, APITimeoutError)
-    while current is not None and id(current) not in visited:
+
+    def eligible(current: BaseException, visited: set[int]) -> bool:
+        if id(current) in visited:
+            return False
         visited.add(id(current))
+        if isinstance(current, UsageLimitExceeded):
+            return False
+        if isinstance(current, ModelHTTPError):
+            return current.status_code == 429 or 500 <= current.status_code <= 599
         if isinstance(current, timeout_types):
-            logger.warning(
-                "Model fallback eligible model=%s error=%s",
-                getattr(error, "model_name", "unknown"),
-                type(current).__name__,
-            )
             return True
-        current = current.__cause__ or current.__context__
-    return False
+        if isinstance(current, BaseExceptionGroup):
+            return bool(current.exceptions) and all(
+                eligible(item, visited) for item in current.exceptions
+            )
+        if isinstance(current, ModelAPIError):
+            cause = current.__cause__ or current.__context__
+            return cause is not None and eligible(cause, visited)
+        return False
+
+    is_eligible = eligible(error, set())
+    if is_eligible:
+        logger.warning(
+            "Model fallback eligible model=%s error=%s",
+            getattr(error, "model_name", "unknown"),
+            type(error).__name__,
+        )
+    return is_eligible
 
 
 def truncate_utf8(text: str, limit: int, marker: str = _COMPACTION_MARKER) -> str:
