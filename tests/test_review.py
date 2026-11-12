@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pydantic import ValidationError
+from pydantic_ai.exceptions import FallbackExceptionGroup, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
@@ -662,6 +663,83 @@ class ReviewModelFactoryTest(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "ambient-secret"}, clear=True):
             with self.assertRaisesRegex(ValueError, "openai-api-key"):
                 review.build_review_model(config)
+
+
+class FailureSummaryTest(unittest.TestCase):
+    def failure(self) -> FallbackExceptionGroup:
+        return FallbackExceptionGroup(
+            "all models failed",
+            [
+                ModelHTTPError(503, "gemini-primary", {"secret": "do-not-leak"}),
+                TimeoutError("private timeout details"),
+            ],
+        )
+
+    def test_writes_ordered_models_and_sanitized_failure_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            review.write_failure_summary(
+                path,
+                ["google:gemini-primary", "openai:gpt-5-nano"],
+                self.failure(),
+            )
+            summary = path.read_text(encoding="utf-8")
+
+        self.assertIn("google:gemini-primary", summary)
+        self.assertIn("HTTP 503", summary)
+        self.assertIn("openai:gpt-5-nano", summary)
+        self.assertIn("TimeoutError", summary)
+        self.assertIn("No review report was produced", summary)
+        self.assertNotIn("do-not-leak", summary)
+        self.assertNotIn("private timeout details", summary)
+
+    def test_missing_summary_path_is_a_no_op(self) -> None:
+        review.write_failure_summary(None, ["google:gemini-primary"], self.failure())
+
+    def test_main_clears_keys_and_raises_a_sanitized_terminal_error(self) -> None:
+        config = review.ReviewConfig(
+            repository="owner/repository",
+            pull_request_number=42,
+            base_sha="base123",
+            head_sha="head456",
+            model="gemini-primary",
+            api_key="google-secret",
+            source_dir=Path("/checkout"),
+            sandbox_image="node:test",
+            fallback_models=(review.ModelSpec("openai", "gpt-5-nano"),),
+            openai_api_key="openai-secret",
+        )
+        failure = self.failure()
+
+        def fail_review(_config, _sandbox):
+            self.assertNotIn("GEMINI_API_KEY", os.environ)
+            self.assertNotIn("OPENAI_API_KEY", os.environ)
+            raise failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            output_path = Path(directory) / "output"
+            environment = {
+                "GEMINI_API_KEY": "google-secret",
+                "OPENAI_API_KEY": "openai-secret",
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+            }
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.object(review.ReviewConfig, "from_env", return_value=config),
+                patch.object(review, "DockerSandbox") as sandbox_type,
+                patch.object(review, "review_pull_request", side_effect=fail_review),
+            ):
+                sandbox_type.return_value.__enter__.return_value = object()
+                with self.assertRaisesRegex(
+                    RuntimeError, "configured review models failed"
+                ) as caught:
+                    review.main()
+            summary = summary_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("do-not-leak", str(caught.exception))
+        self.assertIn("HTTP 503", summary)
 
 
 class ReviewToolsTest(unittest.TestCase):

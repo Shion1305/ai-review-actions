@@ -7,16 +7,19 @@ import re
 import shlex
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
 from google.genai.types import HttpRetryOptions
 from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
-from pydantic_ai import Agent, ModelRetry, UsageLimitExceeded, UsageLimits
+from pydantic_ai import Agent, FallbackExceptionGroup, ModelRetry, UsageLimitExceeded, UsageLimits
 from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.google import GoogleModel
@@ -1517,9 +1520,48 @@ def verify_checkout(config: ReviewConfig, sandbox: CommandSandbox) -> None:
             raise RuntimeError(f"{label} is not available in the review checkout: {revision}")
 
 
+def _failure_leaves(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for nested in error.exceptions for leaf in _failure_leaves(nested)]
+    return [error]
+
+
+def _failure_label(error: BaseException) -> str:
+    if isinstance(error, ModelHTTPError):
+        return f"HTTP {error.status_code}"
+    return type(error).__name__
+
+
+def write_failure_summary(
+    path: Path | None,
+    models: Sequence[str],
+    error: BaseException,
+) -> None:
+    if path is None:
+        return
+    failures = _failure_leaves(error)
+    lines = [
+        "## AI review model fallback failed",
+        "",
+        "No review report was produced.",
+        "",
+        "| Attempt | Model | Failure |",
+        "| ---: | --- | --- |",
+    ]
+    for index, model_name in enumerate(models):
+        failure = failures[index] if index < len(failures) else error
+        lines.append(
+            f"| {index + 1} | <code>{escape(model_name)}</code> | "
+            f"{escape(_failure_label(failure))} |"
+        )
+    with path.open("a", encoding="utf-8") as summary:
+        summary.write("\n".join(lines) + "\n")
+
+
 def main() -> None:
     config = ReviewConfig.from_env()
     os.environ.pop("GEMINI_API_KEY", None)
+    os.environ.pop("OPENAI_API_KEY", None)
     os.environ.pop("REVIEW_MCP_HEADERS", None)
     os.environ.pop("REVIEW_MCP_SERVERS", None)
     os.environ.pop("REVIEW_CONTEXT", None)
@@ -1531,8 +1573,27 @@ def main() -> None:
         f"Reviewing {config.repository}#{config.pull_request_number} "
         f"at {config.head_sha} with {config.model}"
     )
-    with DockerSandbox(config.source_dir, config.sandbox_image, config.sandbox_network) as sandbox:
-        report = review_pull_request(config, sandbox)
+    try:
+        with DockerSandbox(
+            config.source_dir, config.sandbox_image, config.sandbox_network
+        ) as sandbox:
+            report = review_pull_request(config, sandbox)
+    except Exception as error:
+        if not isinstance(error, FallbackExceptionGroup) and not is_transient_model_error(error):
+            raise
+        summary_value = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+        model_names = [
+            f"google:{config.model}",
+            *(f"{spec.provider}:{spec.name}" for spec in config.fallback_models),
+        ]
+        write_failure_summary(
+            Path(summary_value) if summary_value else None,
+            model_names,
+            error,
+        )
+        raise RuntimeError(
+            "All configured review models failed; see the Actions Summary."
+        ) from None
     write_github_output(report, output_path)
     print(
         f"Review complete={report.review_complete}; "
