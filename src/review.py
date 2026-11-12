@@ -18,11 +18,20 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 from pydantic_ai import Agent, ModelRetry, UsageLimitExceeded, UsageLimits
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.models import Model
-from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 from external_context import MCPServerConfig, build_mcp_toolsets, parse_mcp_settings
-from model_io import BoundedReviewModel, ReviewGoogleJsonSchemaTransformer, compact_history
+from model_io import (
+    BoundedReviewModel,
+    ReviewGoogleJsonSchemaTransformer,
+    compact_history,
+    is_transient_model_error,
+)
 
 
 def parse_review_context(raw: str) -> dict[str, Any]:
@@ -1219,6 +1228,37 @@ Do not write a review-completion claim or an approval recommendation anywhere in
 """
 
 
+def build_review_model(config: ReviewConfig) -> Model[Any]:
+    specs = (ModelSpec("google", config.model), *config.fallback_models)
+    models: list[Model[Any]] = []
+    for spec in specs:
+        if spec.provider == "google":
+            concrete: Model[Any] = GoogleModel(
+                spec.name,
+                profile={"json_schema_transformer": ReviewGoogleJsonSchemaTransformer},
+                provider=GoogleProvider(
+                    api_key=config.api_key,
+                    retry_options=HttpRetryOptions(attempts=1),
+                ),
+            )
+        else:
+            if not config.openai_api_key:
+                raise ValueError("openai-api-key is required for OpenAI fallback models")
+            concrete = OpenAIResponsesModel(
+                spec.name,
+                provider=OpenAIProvider(api_key=config.openai_api_key),
+            )
+        models.append(BoundedReviewModel(concrete, max_input_bytes=config.model_input_byte_limit))
+
+    if len(models) == 1:
+        return models[0]
+    return FallbackModel(
+        models[0],
+        *models[1:],
+        fallback_on=is_transient_model_error,
+    )
+
+
 def review_pull_request(
     config: ReviewConfig,
     sandbox: CommandSandbox,
@@ -1234,24 +1274,14 @@ def review_pull_request(
         review_context=config.review_context,
         tool_call_limit=config.tool_call_limit,
     )
-    agent_model = model or BoundedReviewModel(
-        GoogleModel(
-            config.model,
-            profile={"json_schema_transformer": ReviewGoogleJsonSchemaTransformer},
-            provider=GoogleProvider(
-                api_key=config.api_key,
-                retry_options=HttpRetryOptions(attempts=1),
-            ),
-        ),
-        max_input_bytes=config.model_input_byte_limit,
-    )
+    agent_model = model or build_review_model(config)
     agent: Agent[None, ReviewDraft] = Agent(
         agent_model,
         output_type=ReviewDraft,
         instructions=SYSTEM_INSTRUCTIONS,
         retries=2,
         tool_timeout=130,
-        model_settings=GoogleModelSettings(
+        model_settings=ModelSettings(
             temperature=0.1,
             timeout=180,
             max_tokens=config.model_output_token_limit,

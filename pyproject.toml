@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
   "httpx2==2.12.0",
-  "pydantic-ai-slim[google,mcp]==2.43.0",
+  "pydantic-ai-slim[google,mcp,openai]==2.43.0",
 ]
 
 [dependency-groups]

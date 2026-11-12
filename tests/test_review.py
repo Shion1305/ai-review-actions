@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
@@ -608,6 +609,59 @@ class ReviewConfigTest(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(ValueError, "between 2 and 240"):
                 review.ReviewConfig.from_env()
+
+
+class ReviewModelFactoryTest(unittest.TestCase):
+    def config(self, **changes) -> review.ReviewConfig:
+        config = review.ReviewConfig(
+            repository="owner/repository",
+            pull_request_number=42,
+            base_sha="base123",
+            head_sha="head456",
+            model="gemini-primary",
+            api_key="google-secret",
+            source_dir=Path("/checkout"),
+            sandbox_image="node:test",
+        )
+        return replace(config, **changes)
+
+    def test_google_only_configuration_keeps_single_bounded_model(self) -> None:
+        model = review.build_review_model(self.config())
+
+        self.assertIsInstance(model, review.BoundedReviewModel)
+        self.assertEqual(model.wrapped.system, "google")
+        self.assertEqual(model.wrapped.model_name, "gemini-primary")
+
+    def test_builds_ordered_google_and_openai_fallback_models(self) -> None:
+        config = self.config(
+            fallback_models=(
+                review.ModelSpec("google", "gemini-secondary"),
+                review.ModelSpec("openai", "gpt-5-nano"),
+            ),
+            openai_api_key="explicit-openai-secret",
+        )
+
+        model = review.build_review_model(config)
+
+        self.assertIsInstance(model, FallbackModel)
+        self.assertEqual(
+            [(item.wrapped.system, item.wrapped.model_name) for item in model.models],
+            [
+                ("google", "gemini-primary"),
+                ("google", "gemini-secondary"),
+                ("openai", "gpt-5-nano"),
+            ],
+        )
+
+    def test_openai_fallback_requires_explicit_configured_key(self) -> None:
+        config = self.config(
+            fallback_models=(review.ModelSpec("openai", "gpt-5-nano"),),
+            openai_api_key="",
+        )
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "ambient-secret"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "openai-api-key"):
+                review.build_review_model(config)
 
 
 class ReviewToolsTest(unittest.TestCase):
