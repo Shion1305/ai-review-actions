@@ -7,22 +7,35 @@ import re
 import shlex
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
 from google.genai.types import HttpRetryOptions
+from openai import AsyncOpenAI
 from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
-from pydantic_ai import Agent, ModelRetry, UsageLimitExceeded, UsageLimits
+from pydantic_ai import Agent, FallbackExceptionGroup, ModelRetry, UsageLimitExceeded, UsageLimits
 from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models import Model
-from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 from external_context import MCPServerConfig, build_mcp_toolsets, parse_mcp_settings
-from model_io import BoundedReviewModel, ReviewGoogleJsonSchemaTransformer, compact_history
+from model_io import (
+    BoundedReviewModel,
+    ReviewGoogleJsonSchemaTransformer,
+    compact_history,
+    is_transient_model_error,
+)
 
 
 def parse_review_context(raw: str) -> dict[str, Any]:
@@ -97,6 +110,54 @@ InvestigationTool = Literal[
 
 
 @dataclass(frozen=True)
+class ModelSpec:
+    provider: Literal["google", "openai"]
+    name: str
+
+
+def _parse_model_spec(value: str) -> ModelSpec:
+    if not value or value != value.strip():
+        raise ValueError(
+            "fallback model names must be non-empty and contain no surrounding whitespace"
+        )
+    if any(character.isspace() for character in value):
+        raise ValueError("fallback model names must not contain whitespace")
+    if ":" not in value:
+        return ModelSpec("google", value)
+    provider, name = value.split(":", 1)
+    if provider not in {"google", "openai"}:
+        raise ValueError(f"unsupported provider in fallback model: {provider}")
+    if not name:
+        raise ValueError("fallback model names must be non-empty")
+    return ModelSpec(provider, name)  # type: ignore[arg-type]
+
+
+def parse_fallback_models(raw: str, primary_model: str) -> tuple[ModelSpec, ...]:
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError("fallback-models must be a valid JSON array") from None
+    if not isinstance(values, list):
+        raise ValueError("fallback-models must be a JSON array")
+    if len(values) > 5:
+        raise ValueError("fallback-models must contain at most 5 models")
+
+    primary = _parse_model_spec(primary_model)
+    seen = {(primary.provider, primary.name)}
+    parsed: list[ModelSpec] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("fallback-models entries must be strings")
+        spec = _parse_model_spec(value)
+        identity = (spec.provider, spec.name)
+        if identity in seen:
+            raise ValueError(f"duplicate fallback model: {value}")
+        seen.add(identity)
+        parsed.append(spec)
+    return tuple(parsed)
+
+
+@dataclass(frozen=True)
 class ReviewConfig:
     repository: str
     pull_request_number: int
@@ -106,6 +167,8 @@ class ReviewConfig:
     api_key: str = field(repr=False)
     source_dir: Path
     sandbox_image: str
+    fallback_models: tuple[ModelSpec, ...] = ()
+    openai_api_key: str = field(default="", repr=False)
     sandbox_network: str = "none"
     review_language: str = "日本語"
     request_limit: int = DEFAULT_REQUEST_LIMIT
@@ -139,6 +202,10 @@ class ReviewConfig:
             api_key=required("GEMINI_API_KEY"),
             source_dir=Path(required("REVIEW_SOURCE_DIRECTORY")),
             sandbox_image=required("REVIEW_SANDBOX_IMAGE"),
+            fallback_models=parse_fallback_models(
+                os.environ.get("REVIEW_FALLBACK_MODELS", "[]"), required("REVIEW_MODEL")
+            ),
+            openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
             sandbox_network=os.environ.get("REVIEW_SANDBOX_NETWORK", "none"),
             review_language=required("REVIEW_LANGUAGE"),
             request_limit=int(required("REVIEW_REQUEST_LIMIT")),
@@ -1165,6 +1232,42 @@ Do not write a review-completion claim or an approval recommendation anywhere in
 """
 
 
+def build_review_model(config: ReviewConfig) -> Model[Any]:
+    specs = (ModelSpec("google", config.model), *config.fallback_models)
+    models: list[Model[Any]] = []
+    for spec in specs:
+        if spec.provider == "google":
+            concrete: Model[Any] = GoogleModel(
+                spec.name,
+                profile={"json_schema_transformer": ReviewGoogleJsonSchemaTransformer},
+                provider=GoogleProvider(
+                    api_key=config.api_key,
+                    retry_options=HttpRetryOptions(attempts=1),
+                ),
+            )
+        else:
+            if not config.openai_api_key:
+                raise ValueError("openai-api-key is required for OpenAI fallback models")
+            concrete = OpenAIResponsesModel(
+                spec.name,
+                provider=OpenAIProvider(
+                    openai_client=AsyncOpenAI(
+                        api_key=config.openai_api_key,
+                        max_retries=0,
+                    )
+                ),
+            )
+        models.append(BoundedReviewModel(concrete, max_input_bytes=config.model_input_byte_limit))
+
+    if len(models) == 1:
+        return models[0]
+    return FallbackModel(
+        models[0],
+        *models[1:],
+        fallback_on=is_transient_model_error,
+    )
+
+
 def review_pull_request(
     config: ReviewConfig,
     sandbox: CommandSandbox,
@@ -1180,24 +1283,14 @@ def review_pull_request(
         review_context=config.review_context,
         tool_call_limit=config.tool_call_limit,
     )
-    agent_model = model or BoundedReviewModel(
-        GoogleModel(
-            config.model,
-            profile={"json_schema_transformer": ReviewGoogleJsonSchemaTransformer},
-            provider=GoogleProvider(
-                api_key=config.api_key,
-                retry_options=HttpRetryOptions(attempts=1),
-            ),
-        ),
-        max_input_bytes=config.model_input_byte_limit,
-    )
+    agent_model = model or build_review_model(config)
     agent: Agent[None, ReviewDraft] = Agent(
         agent_model,
         output_type=ReviewDraft,
         instructions=SYSTEM_INSTRUCTIONS,
         retries=2,
         tool_timeout=130,
-        model_settings=GoogleModelSettings(
+        model_settings=ModelSettings(
             temperature=0.1,
             timeout=180,
             max_tokens=config.model_output_token_limit,
@@ -1433,9 +1526,48 @@ def verify_checkout(config: ReviewConfig, sandbox: CommandSandbox) -> None:
             raise RuntimeError(f"{label} is not available in the review checkout: {revision}")
 
 
+def _failure_leaves(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for nested in error.exceptions for leaf in _failure_leaves(nested)]
+    return [error]
+
+
+def _failure_label(error: BaseException) -> str:
+    if isinstance(error, ModelHTTPError):
+        return f"HTTP {error.status_code}"
+    return type(error).__name__
+
+
+def write_failure_summary(
+    path: Path | None,
+    models: Sequence[str],
+    error: BaseException,
+) -> None:
+    if path is None:
+        return
+    failures = _failure_leaves(error)
+    lines = [
+        "## AI review model fallback failed",
+        "",
+        "No review report was produced.",
+        "",
+        "| Attempt | Model | Failure |",
+        "| ---: | --- | --- |",
+    ]
+    for index, model_name in enumerate(models):
+        failure = failures[index] if index < len(failures) else error
+        lines.append(
+            f"| {index + 1} | <code>{escape(model_name)}</code> | "
+            f"{escape(_failure_label(failure))} |"
+        )
+    with path.open("a", encoding="utf-8") as summary:
+        summary.write("\n".join(lines) + "\n")
+
+
 def main() -> None:
     config = ReviewConfig.from_env()
     os.environ.pop("GEMINI_API_KEY", None)
+    os.environ.pop("OPENAI_API_KEY", None)
     os.environ.pop("REVIEW_MCP_HEADERS", None)
     os.environ.pop("REVIEW_MCP_SERVERS", None)
     os.environ.pop("REVIEW_CONTEXT", None)
@@ -1447,8 +1579,27 @@ def main() -> None:
         f"Reviewing {config.repository}#{config.pull_request_number} "
         f"at {config.head_sha} with {config.model}"
     )
-    with DockerSandbox(config.source_dir, config.sandbox_image, config.sandbox_network) as sandbox:
-        report = review_pull_request(config, sandbox)
+    try:
+        with DockerSandbox(
+            config.source_dir, config.sandbox_image, config.sandbox_network
+        ) as sandbox:
+            report = review_pull_request(config, sandbox)
+    except Exception as error:
+        if not isinstance(error, FallbackExceptionGroup) and not is_transient_model_error(error):
+            raise
+        summary_value = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+        model_names = [
+            f"google:{config.model}",
+            *(f"{spec.provider}:{spec.name}" for spec in config.fallback_models),
+        ]
+        write_failure_summary(
+            Path(summary_value) if summary_value else None,
+            model_names,
+            error,
+        )
+        raise RuntimeError(
+            "All configured review models failed; see the Actions Summary."
+        ) from None
     write_github_output(report, output_path)
     print(
         f"Review complete={report.review_complete}; "

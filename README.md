@@ -1,7 +1,8 @@
 # AI Review Actions
 
 `ynufes-tech/ai-review-actions`は、[Pydantic AI](https://github.com/pydantic/pydantic-ai)
-経由のGeminiを使ってPull RequestをレビューするGitHub Actionです。モデルによるcheckoutの
+経由のGeminiを使ってPull RequestをレビューするGitHub Actionです。任意でGoogleまたは
+OpenAIのフォールバックモデルを設定できます。モデルによるcheckoutの
 調査やコマンド実行は、Gemini APIキーを保持するオーケストレーターではなく、使い捨ての
 Dockerサンドボックス内で行います。
 
@@ -112,6 +113,34 @@ jobs:
 組み込みツールの固定説明文は日本語です。この設定はモデルが生成する部分に適用されます。
 内部のシステムプロンプト、調査指示、ツール説明、モデルへの修正要求は英語です。
 モデル生成文の言語は独立して指定し、JSONのキー・列挙値・コード・コマンドは翻訳しません。
+
+## モデルフォールバック
+
+既定では`model`で指定したGeminiモデルだけを使用し、従来と同じ動作をします。一時的な
+プロバイダー障害に備える場合は、`fallback-models`へ最大5件のモデルを優先順のJSON配列で
+指定します。接頭辞のない名前と`google:`はGoogle、`openai:`はOpenAIを表します。
+
+```yaml
+- id: review
+  uses: ynufes-tech/ai-review-actions@main
+  with:
+    gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+    model: gemini-3.8-flash
+    fallback-models: '["google:gemini-2.5-flash-lite", "openai:gpt-5-nano"]'
+    openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+    # ほかの必須入力は省略
+```
+
+429、5xx、timeoutの場合だけ次のモデルを試します。入力不正や401・403、Action自身の
+使用上限ではプロバイダーを切り替えません。すべてのモデルが失敗するとActionも失敗し、
+試行したモデルとStatus CodeをActions Summaryへ出力します。この場合、空の`report`を
+成功結果として返しません。
+
+モデルが正常に応答しても必要な調査を終えられなかった場合は、従来どおり
+`review_complete: false`のレポートを返します。これはプロバイダー障害とは区別されます。
+
+フォールバックは未設定なら無効です。Actionは利用料金や月間予算を管理しないため、OpenAI等の
+有料モデルを指定する場合は、利用者がモデル選択・プロバイダー側の上限・請求アラートを設定してください。
 
 ## 出力
 
@@ -507,10 +536,11 @@ input/output/cacheトークン数もログに記録し、運用時の調整に�
 要求ごとの入力上限を満たす場合は、ツールの結果を受け取り次の要求へ進みます。
 内部の分間送信量予算や固定の要求間隔は設けません。旧入力`model-input-bytes-per-minute`は削除したため、
 利用側ワークフローに指定している場合は取り除いてください。
-429・502・503が返された場合は、最大3試行まで待機して再送します。`Retry-After`とGoogleの
+429・502・503が返された場合は、各モデルで最大3試行まで待機して再送します。`Retry-After`とGoogleの
 `RetryInfo`を尊重し、SDK内部の重複リトライは無効化します。再送ではツールを再実行しません。
-再試行の待機は1要求で合計180秒までです。要求ごとの入力上限・再試行待機の上限を超えた場合や
-429の継続時は未完了レポートを返し、承認しません。認証エラー等は通常の失敗として扱います。
+再試行の待機は1要求で合計180秒までです。429または5xxが解消しなければ、設定済みの次の
+モデルを試します。すべてのモデルが失敗した場合はActionを失敗させ、空のレポートを返しません。
+要求ごとの入力上限・再試行待機の上限では未完了レポートを返し、認証エラー等は通常の失敗として扱います。
 
 Geminiの制限はAPIキー単位ではなくプロジェクト単位なので、
 他のPRやアプリと同時実行すれば429は起こり得ます。[Googleのレート制限](https://ai.google.dev/gemini-api/docs/rate-limits)

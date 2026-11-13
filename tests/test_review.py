@@ -11,7 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pydantic import ValidationError
+from pydantic_ai.exceptions import FallbackExceptionGroup, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
@@ -530,13 +532,8 @@ class ReviewPromptTest(unittest.TestCase):
 
 
 class ReviewConfigTest(unittest.TestCase):
-    def test_rejects_unrestricted_network_modes(self) -> None:
-        for network in ["host", "bridge", "", "invalid"]:
-            with self.assertRaisesRegex(ValueError, "network must be none or public"):
-                review.DockerSandbox(Path("."), "node:test", network=network)
-
-    def test_rejects_limits_above_the_action_ceiling(self) -> None:
-        environment = {
+    def environment(self) -> dict[str, str]:
+        return {
             "REVIEW_REPOSITORY": "owner/repository",
             "REVIEW_PULL_REQUEST_NUMBER": "42",
             "REVIEW_BASE_SHA": "base123",
@@ -546,6 +543,65 @@ class ReviewConfigTest(unittest.TestCase):
             "REVIEW_SOURCE_DIRECTORY": "/checkout",
             "REVIEW_SANDBOX_IMAGE": "node:test",
             "REVIEW_LANGUAGE": "日本語",
+            "REVIEW_REQUEST_LIMIT": "120",
+            "REVIEW_TOOL_CALL_LIMIT": "100",
+            "REVIEW_INVESTIGATION_TOOL_LIMIT": "80",
+        }
+
+    def test_parses_ordered_google_and_openai_fallback_models(self) -> None:
+        self.assertEqual(review.parse_fallback_models("[]", "gemini-test"), ())
+        self.assertEqual(
+            review.parse_fallback_models(
+                '["gemini-lite", "google:gemini-stable", "openai:gpt-5-nano"]',
+                "gemini-test",
+            ),
+            (
+                review.ModelSpec("google", "gemini-lite"),
+                review.ModelSpec("google", "gemini-stable"),
+                review.ModelSpec("openai", "gpt-5-nano"),
+            ),
+        )
+
+    def test_rejects_invalid_fallback_model_configuration(self) -> None:
+        cases = [
+            ("not-json", "valid JSON array"),
+            ('{"model":"gemini-lite"}', "JSON array"),
+            ('[""]', "non-empty"),
+            ('[" openai:gpt-5-nano"]', "whitespace"),
+            ('["anthropic:claude"]', "unsupported provider"),
+            ('["gemini-a", "google:gemini-a"]', "duplicate"),
+            (
+                '["gemini-a", "gemini-b", "gemini-c", "gemini-d", "gemini-e", "gemini-f"]',
+                "at most 5",
+            ),
+        ]
+        for raw, message in cases:
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, message):
+                review.parse_fallback_models(raw, "gemini-test")
+
+    def test_rejects_primary_model_repeated_as_explicit_google_fallback(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            review.parse_fallback_models('["google:gemini-test"]', "gemini-test")
+
+    def test_reads_optional_fallback_models_and_openai_key_from_environment(self) -> None:
+        environment = self.environment() | {
+            "REVIEW_FALLBACK_MODELS": '["openai:gpt-5-nano"]',
+            "OPENAI_API_KEY": "openai-secret",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            config = review.ReviewConfig.from_env()
+
+        self.assertEqual(config.fallback_models, (review.ModelSpec("openai", "gpt-5-nano"),))
+        self.assertEqual(config.openai_api_key, "openai-secret")
+
+    def test_rejects_unrestricted_network_modes(self) -> None:
+        for network in ["host", "bridge", "", "invalid"]:
+            with self.assertRaisesRegex(ValueError, "network must be none or public"):
+                review.DockerSandbox(Path("."), "node:test", network=network)
+
+    def test_rejects_limits_above_the_action_ceiling(self) -> None:
+        environment = self.environment() | {
             "REVIEW_REQUEST_LIMIT": "241",
             "REVIEW_TOOL_CALL_LIMIT": "30",
             "REVIEW_INVESTIGATION_TOOL_LIMIT": "24",
@@ -554,6 +610,148 @@ class ReviewConfigTest(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(ValueError, "between 2 and 240"):
                 review.ReviewConfig.from_env()
+
+
+class ReviewModelFactoryTest(unittest.TestCase):
+    def config(self, **changes) -> review.ReviewConfig:
+        config = review.ReviewConfig(
+            repository="owner/repository",
+            pull_request_number=42,
+            base_sha="base123",
+            head_sha="head456",
+            model="gemini-primary",
+            api_key="google-secret",
+            source_dir=Path("/checkout"),
+            sandbox_image="node:test",
+        )
+        return replace(config, **changes)
+
+    def test_google_only_configuration_keeps_single_bounded_model(self) -> None:
+        model = review.build_review_model(self.config())
+
+        self.assertIsInstance(model, review.BoundedReviewModel)
+        self.assertEqual(model.wrapped.system, "google")
+        self.assertEqual(model.wrapped.model_name, "gemini-primary")
+
+    def test_builds_ordered_google_and_openai_fallback_models(self) -> None:
+        config = self.config(
+            fallback_models=(
+                review.ModelSpec("google", "gemini-secondary"),
+                review.ModelSpec("openai", "gpt-5-nano"),
+            ),
+            openai_api_key="explicit-openai-secret",
+        )
+
+        model = review.build_review_model(config)
+
+        self.assertIsInstance(model, FallbackModel)
+        self.assertEqual(
+            [(item.wrapped.system, item.wrapped.model_name) for item in model.models],
+            [
+                ("google", "gemini-primary"),
+                ("google", "gemini-secondary"),
+                ("openai", "gpt-5-nano"),
+            ],
+        )
+
+    def test_openai_fallback_requires_explicit_configured_key(self) -> None:
+        config = self.config(
+            fallback_models=(review.ModelSpec("openai", "gpt-5-nano"),),
+            openai_api_key="",
+        )
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "ambient-secret"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "openai-api-key"):
+                review.build_review_model(config)
+
+    def test_openai_fallback_disables_sdk_retries(self) -> None:
+        config = self.config(
+            fallback_models=(review.ModelSpec("openai", "gpt-5-nano"),),
+            openai_api_key="explicit-openai-secret",
+        )
+
+        model = review.build_review_model(config)
+
+        assert isinstance(model, FallbackModel)
+        openai_model = model.models[1].wrapped
+        self.assertEqual(openai_model.client.max_retries, 0)
+
+
+class FailureSummaryTest(unittest.TestCase):
+    def failure(self) -> FallbackExceptionGroup:
+        return FallbackExceptionGroup(
+            "all models failed",
+            [
+                ModelHTTPError(503, "gemini-primary", {"secret": "do-not-leak"}),
+                TimeoutError("private timeout details"),
+            ],
+        )
+
+    def test_writes_ordered_models_and_sanitized_failure_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.md"
+            review.write_failure_summary(
+                path,
+                ["google:gemini-primary", "openai:gpt-5-nano"],
+                self.failure(),
+            )
+            summary = path.read_text(encoding="utf-8")
+
+        self.assertIn("google:gemini-primary", summary)
+        self.assertIn("HTTP 503", summary)
+        self.assertIn("openai:gpt-5-nano", summary)
+        self.assertIn("TimeoutError", summary)
+        self.assertIn("No review report was produced", summary)
+        self.assertNotIn("do-not-leak", summary)
+        self.assertNotIn("private timeout details", summary)
+
+    def test_missing_summary_path_is_a_no_op(self) -> None:
+        review.write_failure_summary(None, ["google:gemini-primary"], self.failure())
+
+    def test_main_clears_keys_and_raises_a_sanitized_terminal_error(self) -> None:
+        config = review.ReviewConfig(
+            repository="owner/repository",
+            pull_request_number=42,
+            base_sha="base123",
+            head_sha="head456",
+            model="gemini-primary",
+            api_key="google-secret",
+            source_dir=Path("/checkout"),
+            sandbox_image="node:test",
+            fallback_models=(review.ModelSpec("openai", "gpt-5-nano"),),
+            openai_api_key="openai-secret",
+        )
+        failure = self.failure()
+
+        def fail_review(_config, _sandbox):
+            self.assertNotIn("GEMINI_API_KEY", os.environ)
+            self.assertNotIn("OPENAI_API_KEY", os.environ)
+            raise failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            output_path = Path(directory) / "output"
+            environment = {
+                "GEMINI_API_KEY": "google-secret",
+                "OPENAI_API_KEY": "openai-secret",
+                "GITHUB_OUTPUT": str(output_path),
+                "GITHUB_STEP_SUMMARY": str(summary_path),
+            }
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.object(review.ReviewConfig, "from_env", return_value=config),
+                patch.object(review, "DockerSandbox") as sandbox_type,
+                patch.object(review, "review_pull_request", side_effect=fail_review),
+            ):
+                sandbox_type.return_value.__enter__.return_value = object()
+                with self.assertRaisesRegex(
+                    RuntimeError, "configured review models failed"
+                ) as caught:
+                    review.main()
+            summary = summary_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("do-not-leak", str(caught.exception))
+        self.assertIn("HTTP 503", summary)
 
 
 class ReviewToolsTest(unittest.TestCase):

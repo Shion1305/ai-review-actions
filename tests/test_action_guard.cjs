@@ -27,3 +27,15 @@ test("analysis checks the downloaded implementation before dependencies, Docker,
   assert.throws(() => run(JSON.stringify({ source_digest: "0".repeat(64) })), /implementation changed/);
   assert.throws(() => run(JSON.stringify({ source_digest: "main" })), /source_digest/);
 });
+
+test("analysis exposes optional fallback models and an explicit OpenAI key", () => {
+  const action = readFileSync(resolve(__dirname, "..", "action.yml"), "utf8");
+  const inputs = action.slice(action.indexOf("inputs:\n"), action.indexOf("outputs:\n"));
+  const reviewStep = action.slice(action.indexOf("    - name: Pull Requestをレビュー"));
+
+  assert.match(inputs, /gemini-api-key:\n(?:.*\n){0,3}\s+required: true/);
+  assert.match(inputs, /fallback-models:\n(?:.*\n){0,4}\s+required: false\n\s+default: "\[\]"/);
+  assert.match(inputs, /openai-api-key:\n(?:.*\n){0,4}\s+required: false\n\s+default: ""/);
+  assert.match(reviewStep, /REVIEW_FALLBACK_MODELS: \$\{\{ inputs\.fallback-models \}\}/);
+  assert.match(reviewStep, /OPENAI_API_KEY: \$\{\{ inputs\.openai-api-key \}\}/);
+});

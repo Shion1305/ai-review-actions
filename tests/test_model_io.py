@@ -13,7 +13,7 @@ from google.genai.types import HttpRetryOptions
 from pydantic import ValidationError
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.capabilities import ProcessHistory
-from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UsageLimitExceeded
 from pydantic_ai.messages import (
     InstructionPart,
     ModelMessage,
@@ -27,6 +27,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.models.wrapper import WrapperModel
@@ -36,6 +37,7 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RequestUsage
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+import model_io  # noqa: E402
 from model_io import (  # noqa: E402
     BoundedReviewModel,
     ReviewGoogleJsonSchemaTransformer,
@@ -243,6 +245,102 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
     def model(self, function, clock=None, **kwargs):
         clock = clock or FakeClock()
         return BoundedReviewModel(FunctionModel(function), sleep=clock.sleep, **kwargs)
+
+    def test_only_transient_provider_failures_are_fallback_eligible(self) -> None:
+        for status in [429, 500, 502, 503, 504, 599]:
+            with self.subTest(status=status):
+                self.assertTrue(
+                    model_io.is_transient_model_error(ModelHTTPError(status, "primary"))
+                )
+        for status in [400, 401, 403, 404]:
+            with self.subTest(status=status):
+                self.assertFalse(
+                    model_io.is_transient_model_error(ModelHTTPError(status, "primary"))
+                )
+        self.assertTrue(model_io.is_transient_model_error(TimeoutError("timed out")))
+        wrapped_timeout = ModelAPIError("openai-model", "connection failed")
+        wrapped_timeout.__cause__ = TimeoutError("provider timed out")
+        self.assertTrue(model_io.is_transient_model_error(wrapped_timeout))
+        self.assertFalse(model_io.is_transient_model_error(UsageLimitExceeded("local limit")))
+        self.assertFalse(model_io.is_transient_model_error(RuntimeError("unrelated")))
+
+    def test_timeout_exception_groups_are_classified_conservatively(self) -> None:
+        self.assertTrue(
+            model_io.is_transient_model_error(
+                ExceptionGroup("provider", [TimeoutError("provider timed out")])
+            )
+        )
+        self.assertFalse(
+            model_io.is_transient_model_error(
+                ExceptionGroup(
+                    "provider",
+                    [TimeoutError("provider timed out"), RuntimeError("unrelated")],
+                )
+            )
+        )
+
+        unrelated_wrapper = RuntimeError("unrelated")
+        unrelated_wrapper.__cause__ = TimeoutError("provider timed out")
+        self.assertFalse(model_io.is_transient_model_error(unrelated_wrapper))
+
+        local_limit = UsageLimitExceeded("local limit")
+        local_limit.__cause__ = TimeoutError("provider timed out")
+        self.assertFalse(model_io.is_transient_model_error(local_limit))
+
+    async def test_transient_continuation_failure_falls_back_without_rerunning_tool(self) -> None:
+        primary_calls: list[bytes] = []
+        fallback_calls: list[bytes] = []
+        tool_runs: list[int] = []
+
+        def primary(messages, _info):
+            primary_calls.append(ModelMessagesTypeAdapter.dump_json(messages))
+            if len(primary_calls) == 1:
+                return ModelResponse(parts=[ToolCallPart("inspect_source", {})])
+            raise ModelHTTPError(503, "primary")
+
+        def fallback(messages, _info):
+            fallback_calls.append(ModelMessagesTypeAdapter.dump_json(messages))
+            return ModelResponse(parts=[TextPart("Finished")])
+
+        model = FallbackModel(
+            self.model(primary),
+            self.model(fallback),
+            fallback_on=model_io.is_transient_model_error,
+        )
+        agent = Agent(model)
+
+        @agent.tool_plain
+        def inspect_source() -> str:
+            tool_runs.append(1)
+            return "source"
+
+        result = await agent.run("Review")
+
+        self.assertEqual(result.output, "Finished")
+        self.assertEqual(tool_runs, [1])
+        self.assertEqual(len(primary_calls), 4)
+        self.assertEqual(len(fallback_calls), 1)
+        self.assertEqual(primary_calls[-1], fallback_calls[0])
+
+    async def test_permanent_failure_does_not_call_fallback_model(self) -> None:
+        fallback_calls = []
+
+        def primary(_messages, _info):
+            raise ModelHTTPError(401, "primary")
+
+        def fallback(messages, _info):
+            fallback_calls.append(messages)
+            return ModelResponse(parts=[TextPart("unexpected")])
+
+        model = FallbackModel(
+            self.model(primary),
+            self.model(fallback),
+            fallback_on=model_io.is_transient_model_error,
+        )
+
+        with self.assertRaises(ModelHTTPError):
+            await Agent(model).run("Review")
+        self.assertEqual(fallback_calls, [])
 
     async def test_instruction_deduplication_does_not_change_google_wire_request(self):
         wire_requests = []
@@ -745,17 +843,17 @@ class ModelIOTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("private-", output)
 
-    async def test_exhausted_429_becomes_safe_usage_limit(self) -> None:
+    async def test_exhausted_429_remains_available_to_fallback(self) -> None:
         calls = []
 
         def respond(_messages, _info):
             calls.append(1)
             raise ModelHTTPError(429, "fake", {"secret": "do-not-leak"})
 
-        with self.assertRaises(UsageLimitExceeded) as caught:
+        with self.assertRaises(ModelHTTPError) as caught:
             await Agent(self.model(respond)).run("Review")
         self.assertEqual(len(calls), 3)
-        self.assertNotIn("do-not-leak", str(caught.exception))
+        self.assertEqual(caught.exception.status_code, 429)
 
     async def test_long_retry_after_stops_without_ignoring_provider_delay(self) -> None:
         clock = FakeClock()

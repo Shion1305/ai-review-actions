@@ -14,6 +14,14 @@ inputs:
     description: 使用するGeminiモデル名。
     required: false
     default: gemini-3.8-flash
+  fallback-models:
+    description: 一時的なモデル障害時に順番に試すGoogleまたはOpenAIモデル名のJSON配列。
+    required: false
+    default: "[]"
+  openai-api-key:
+    description: openai:で始まるフォールバックモデルを使用する場合のOpenAI APIキー。
+    required: false
+    default: ""
   review-language:
     description: モデルが生成する要約・指摘・評価などの言語。Action固定の表示文は日本語。
     required: false
@@ -131,8 +139,10 @@ runs:
       shell: bash
       env:
         GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         PYDANTIC_AI_NO_BANNER: "1"
         REVIEW_MODEL: ${{ inputs.model }}
+        REVIEW_FALLBACK_MODELS: ${{ inputs.fallback-models }}
         REVIEW_LANGUAGE: ${{ inputs.review-language }}
         REVIEW_REPOSITORY: ${{ inputs.repository }}
         REVIEW_PULL_REQUEST_NUMBER: ${{ inputs.pull-request-number }}
